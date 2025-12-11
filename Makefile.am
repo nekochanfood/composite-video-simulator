@@ -3,6 +3,7 @@ ACLOCAL_AMFLAGS = -I m4
 top = $(shell pwd)
 
 bin_PROGRAMS = \
+	ffmpeg_vhsled \
 	frameblend \
 	filmac
 
@@ -82,6 +83,10 @@ ffmpeg_raw28ntsc_step6_LDADD = $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $
 ffmpeg_raw28ntsc_step7_SOURCES = ffmpeg_raw28ntsc_step7.cpp
 ffmpeg_raw28ntsc_step7_CXXFLAGS = $(AVCODEC_CFLAGS) $(AVFORMAT_CFLAGS) $(AVUTIL_CFLAGS) $(SWSCALE_CFLAGS) $(SWRESAMPLE_CFLAGS)
 ffmpeg_raw28ntsc_step7_LDADD = $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS)
+
+ffmpeg_vhsled_SOURCES = ffmpeg_vhsled.cpp
+ffmpeg_vhsled_CXXFLAGS = $(AVCODEC_CFLAGS) $(AVFORMAT_CFLAGS) $(AVUTIL_CFLAGS) $(SWSCALE_CFLAGS) $(SWRESAMPLE_CFLAGS)
+ffmpeg_vhsled_LDADD = $(AVCODEC_LIBS) $(AVFORMAT_LIBS) $(AVUTIL_LIBS) $(SWSCALE_LIBS) $(SWRESAMPLE_LIBS)
 
 ffmpeg_colorkey_SOURCES = ffmpeg_colorkey.cpp
 ffmpeg_colorkey_CXXFLAGS = $(AVCODEC_CFLAGS) $(AVFORMAT_CFLAGS) $(AVUTIL_CFLAGS) $(SWSCALE_CFLAGS) $(SWRESAMPLE_CFLAGS)
