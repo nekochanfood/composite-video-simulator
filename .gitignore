@@ -1,25 +1,111 @@
-ffmpeg_to_composite
-autom4te.cache
-aclocal.m4
-.deps
+# Build directories
+build/
+build_*/
+.deps/
 .deps/*
-*~
-*.o
-*.a
-*.la
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Autotools generated files
+autom4te.cache/
+aclocal.m4
 compile
+config.guess
 config.h
 config.h.in
+config.h.in~
 config.log
 config.status
+config.sub
 configure
-configure.in
+configure~
+depcomp
+stamp-h1
+install-sh
+missing
+INSTALL
+COPYING
 Makefile
 Makefile.in
-install-sh
-stamp-h1
-depcomp
-INSTALL
-missing
-COPYING
+libtool
+.libs/
+*.la
+*.lo
 
+# Compiled binaries
+ffmpeg_ntsc
+ffmpeg_vhsled
+ffmpeg_to_composite
+ffmpeg_average_delay
+ffmpeg_cassette
+ffmpeg_colorkey
+ffmpeg_colormap
+ffmpeg_posterize
+ffmpeg_raw28ntsc
+ffmpeg_raw28ntsc_step*
+ffmpeg_scanimate
+frameblend
+filmac
+normalize_ts
+
+# Object files
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CUDA compiled files
+*.ptx
+*.cubin
+*.fatbin
+
+# Editor backups
+*~
+*.swp
+*.swo
+*.bak
+.*.sw?
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+.DS_Store
+
+# Output files
+.outputs/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.flv
+*.wmv
+*.m4v
+*.mpg
+*.mpeg
+
+# Sample/test files (uncomment if you don't want to track samples)
+# .samples/
+
+# Test output
+test_output/
+
+# Debian packages
+*.deb
+
+# Log files
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+.samples

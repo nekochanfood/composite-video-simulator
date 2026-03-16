@@ -5,7 +5,8 @@ top = $(shell pwd)
 bin_PROGRAMS = \
 	ffmpeg_vhsled \
 	frameblend \
-	filmac
+	filmac \
+	ffmpeg_ntsc
 
 bin_DISABLED = \
 	ffmpeg_raw28ntsc_step7 \
@@ -23,8 +24,7 @@ bin_DISABLED = \
 	ffmpeg_colorkey \
 	ffmpeg_colormap \
 	ffmpeg_cassette \
-	normalize_ts \
-	ffmpeg_ntsc
+	normalize_ts
 
 noinst_PROGRAMS =
 

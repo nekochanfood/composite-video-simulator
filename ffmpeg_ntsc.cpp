@@ -4,203 +4,32 @@
 //      The "posterize" we emulate here is more the type where you run the video through an ADC, truncate the least significant
 //      bits, then run back through a DAC on the other side (well within the realm of 1980s/1990s hardware)
 
-#define __STDC_CONSTANT_MACROS
-#define __STDC_LIMIT_MACROS
+#include "common.h"
+#include "lowpass_filter.h"
+#include "color_convert.h"
+#include "output_context.h"
+#include <chrono>
 
-#include <sys/types.h>
-#include <signal.h>
-#include <stdint.h>
-#include <assert.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <math.h>
+#ifdef HAVE_CUDA
+#include "ntsc_cuda.h"
+static bool cuda_available = false;
 
-extern "C" {
-#include <libavutil/opt.h>
-#include <libavutil/avutil.h>
-#include <libavutil/pixfmt.h>
-#include <libavutil/pixdesc.h>
-#include <libavutil/samplefmt.h>
-#include <libavutil/pixelutils.h>
-
-#include <libavcodec/avcodec.h>
-#include <libavcodec/version.h>
-
-#include <libavformat/avformat.h>
-#include <libavformat/avio.h>
-#include <libavformat/version.h>
-
-#include <libswscale/swscale.h>
-#include <libswscale/version.h>
-
-#include <libswresample/swresample.h>
-#include <libswresample/version.h>
-}
-
-using namespace std;
-
-#include <map>
-#include <string>
-#include <vector>
-#include <stdexcept>
-
-/* return a floating point value specifying what to scale the sample
- * value by to reduce it from full volume to dB decibels */
-double dBFS(double dB)
-{
-	/* 10 ^ (dB / 20),
-	   based on reversing the formula for converting samples to decibels:
-	   dB = 20.0 * log10(sample);
-	   where "sample" is -1.0 <= x <= 1.0 */
-	return pow(10.0,dB / 20.0);
-}
-
-/* attenuate a sample value by this many dBFS */
-/* so if you want to reduce it by 20dBFS you pass -20 as dB */
-double attenuate_dBFS(double sample,double dB)
-{
-	return sample * dBFS(dB);
-}
-
-/* opposite: convert sample to decibels */
-double dBFS_measure(double sample) {
-	return 20.0 * log10(sample);
-}
-
-// lowpass filter
-// you can make it a highpass filter by applying a lowpass then subtracting from source.
-class LowpassFilter {
-public:
-	LowpassFilter() : timeInterval(0), cutoff(0), alpha(0), prev(0), tau(0) {
-	}
-	void setFilter(const double rate/*sample rate of audio*/,const double hz/*cutoff*/) {
-#ifndef M_PI
-#error your math.h does not include M_PI constant
+// Double-buffered async GPU pipeline state
+struct GpuPipelineState {
+    AVFrame* gpu_output_frame[NTSC_CUDA_NUM_BUFFERS];  // GPU writes to these
+    int current_buf_idx;           // Buffer index for current frame being submitted to GPU
+    bool has_pending_frame;        // Is there a completed GPU frame waiting to be processed?
+    int pending_buf_idx;           // Which buffer has the pending frame
+    signed long long pending_fieldno;  // Field number of pending frame
+    size_t pending_frame_idx;      // output_avstream_video_frame index for pending frame
+    
+    GpuPipelineState() : current_buf_idx(0), has_pending_frame(false), pending_buf_idx(0), pending_fieldno(0), pending_frame_idx(0) {
+        gpu_output_frame[0] = nullptr;
+        gpu_output_frame[1] = nullptr;
+    }
+};
+static GpuPipelineState gpu_pipeline;
 #endif
-		timeInterval = 1.0 / rate;
-		tau = 1 / (hz * 2 * M_PI);
-		cutoff = hz;
-		alpha = timeInterval / (tau + timeInterval);
-	}
-	void resetFilter(const double val=0) {
-		prev = val;
-	}
-	double lowpass(const double sample) {
-		const double stage1 = sample * alpha;
-		const double stage2 = prev - (prev * alpha); /* NTS: Instead of prev * (1.0 - alpha) */
-		return (prev = (stage1 + stage2)); /* prev = stage1+stage2 then return prev */
-	}
-	double highpass(const double sample) {
-		const double stage1 = sample * alpha;
-		const double stage2 = prev - (prev * alpha); /* NTS: Instead of prev * (1.0 - alpha) */
-		return sample - (prev = (stage1 + stage2)); /* prev = stage1+stage2 then return (sample - prev) */
-	}
-public:
-	double			timeInterval;
-	double			cutoff;
-	double			alpha; /* timeInterval / (tau + timeInterval) */
-	double			prev;
-	double			tau;
-};
-
-class HiLoPair {
-public:
-	LowpassFilter		hi,lo;	// highpass, lowpass
-public:
-	void setFilter(const double rate/*sample rate of audio*/,const double low_hz,const double high_hz) {
-		lo.setFilter(rate,low_hz);
-		hi.setFilter(rate,high_hz);
-	}
-	double filter(const double sample) {
-		return hi.highpass(lo.lowpass(sample)); /* first lowpass, then highpass */
-	}
-};
-
-class HiLoPass : public vector<HiLoPair> { // all passes, one sample of one channel
-public:
-	HiLoPass() : vector() { }
-public:
-	void setFilter(const double rate/*sample rate of audio*/,const double low_hz,const double high_hz) {
-		for (size_t i=0;i < size();i++) (*this)[i].setFilter(rate,low_hz,high_hz);
-	}
-	double filter(double sample) {
-		for (size_t i=0;i < size();i++) sample = (*this)[i].lo.lowpass(sample);
-		for (size_t i=0;i < size();i++) sample = (*this)[i].hi.highpass(sample);
-		return sample;
-	}
-	void init(const unsigned int passes) {
-		clear();
-		resize(passes);
-		assert(size() >= passes);
-	}
-};
-
-class HiLoSample : public vector<HiLoPass> { // all passes, all channels of one sample period
-public:
-	HiLoSample() : vector() { }
-public:
-	void init(const unsigned int channels,const unsigned int passes) {
-		clear();
-		resize(channels);
-		assert(size() >= channels);
-		for (size_t i=0;i < size();i++) (*this)[i].init(passes);
-	}
-	void setFilter(const double rate/*sample rate of audio*/,const double low_hz,const double high_hz) {
-		for (size_t i=0;i < size();i++) (*this)[i].setFilter(rate,low_hz,high_hz);
-	}
-};
-
-class HiLoComboPass {
-public:
-	HiLoComboPass() : passes(0), channels(0), rate(0), low_cutoff(0), high_cutoff(0) {
-	}
-	~HiLoComboPass() {
-		clear();
-	}
-	void setChannels(const size_t _channels) {
-		if (channels != _channels) {
-			clear();
-			channels = _channels;
-		}
-	}
-	void setCutoff(const double _low_cutoff,const double _high_cutoff) {
-		if (low_cutoff != _low_cutoff || high_cutoff != _high_cutoff) {
-			clear();
-			low_cutoff = _low_cutoff;
-			high_cutoff = _high_cutoff;
-		}
-	}
-	void setRate(const double _rate) {
-		if (rate != _rate) {
-			clear();
-			rate = _rate;
-		}
-	}
-	void setPasses(const size_t _passes) {
-		if (passes != _passes) {
-			clear();
-			passes = _passes;
-		}
-	}
-	void clear() {
-		audiostate.clear();
-	}
-	void init() {
-		clear();
-		if (channels == 0 || passes == 0 || rate == 0 || low_cutoff == 0 || high_cutoff == 0) return;
-		audiostate.init(channels,passes);
-		audiostate.setFilter(rate,low_cutoff,high_cutoff);
-	}
-public:
-	double		rate;
-	size_t		passes;
-	size_t		channels;
-	double		low_cutoff;
-	double		high_cutoff;
-	HiLoSample	audiostate;
-};
 
 bool            use_422_colorspace = false; // I would default this to true but Adobe Premiere Pro apparently can't handle 4:2:2 H.264 >:(
 AVRational	output_field_rate = { 60000, 1001 };	// NTSC 60Hz default
@@ -212,8 +41,6 @@ int		output_audio_channels = 2;	// VHS stereo (set to 1 for mono)
 int		output_audio_rate = 44100;	// VHS Hi-Fi goes up to 20KHz
 int     video_scanline_phase_shift = 180;
 int     video_scanline_phase_shift_offset = 0;
-
-#define RGBTRIPLET(r,g,b)       (((uint32_t)(r) << (uint32_t)16) + ((uint32_t)(g) << (uint32_t)8) + ((uint32_t)(b) << (uint32_t)0))
 
 AVFormatContext*	        output_avfmt = NULL;
 AVStream*		            output_avstream_audio = NULL;	            // do not free
@@ -241,7 +68,7 @@ public:
         input_avstream_video_resampler = NULL;
         input_avstream_video_codec_context = NULL;
         next_pts = next_dts = -1LL;
-        avpkt_valid = false;
+        avpkt = NULL;
         eof_stream = false;
         eof = false;
     }
@@ -275,35 +102,44 @@ public:
                     is = input_avfmt->streams[i];
                     if (is == NULL) continue;
 
-                    isctx = is->codec;
-                    if (isctx == NULL) continue;
-
-                    if (isctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    if (is->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                         if (input_avstream_audio == NULL && ac == 0) {
-                            if (avcodec_open2(isctx,avcodec_find_decoder(isctx->codec_id),NULL) >= 0) {
-                                input_avstream_audio = is;
-                                input_avstream_audio_codec_context = isctx;
-                                fprintf(stderr,"Found audio stream idx=%zu %u-channel %uHz\n",
-                                        i,
-                                        input_avstream_audio_codec_context->channels,
-                                        input_avstream_audio_codec_context->sample_rate);
-                            }
-                            else {
-                                fprintf(stderr,"Found audio stream but not able to decode\n");
+                            const AVCodec *dec = avcodec_find_decoder(is->codecpar->codec_id);
+                            if (dec != NULL) {
+                                isctx = avcodec_alloc_context3(dec);
+                                if (isctx != NULL && avcodec_parameters_to_context(isctx, is->codecpar) >= 0 &&
+                                        avcodec_open2(isctx, dec, NULL) >= 0) {
+                                    input_avstream_audio = is;
+                                    input_avstream_audio_codec_context = isctx;
+                                    fprintf(stderr,"Found audio stream idx=%zu %u-channel %uHz\n",
+                                            i,
+                                            input_avstream_audio_codec_context->ch_layout.nb_channels,
+                                            input_avstream_audio_codec_context->sample_rate);
+                                }
+                                else {
+                                    avcodec_free_context(&isctx);
+                                    fprintf(stderr,"Found audio stream but not able to decode\n");
+                                }
                             }
                         }
 
                         ac++;
                     }
-                    else if (isctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    else if (is->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                         if (input_avstream_video == NULL && vc == 0) {
-                            if (avcodec_open2(isctx,avcodec_find_decoder(isctx->codec_id),NULL) >= 0) {
-                                input_avstream_video = is;
-                                input_avstream_video_codec_context = isctx;
-                                fprintf(stderr,"Found video stream idx=%zu\n",i);
-                            }
-                            else {
-                                fprintf(stderr,"Found video stream but not able to decode\n");
+                            const AVCodec *dec = avcodec_find_decoder(is->codecpar->codec_id);
+                            if (dec != NULL) {
+                                isctx = avcodec_alloc_context3(dec);
+                                if (isctx != NULL && avcodec_parameters_to_context(isctx, is->codecpar) >= 0 &&
+                                        avcodec_open2(isctx, dec, NULL) >= 0) {
+                                    input_avstream_video = is;
+                                    input_avstream_video_codec_context = isctx;
+                                    fprintf(stderr,"Found video stream idx=%zu\n",i);
+                                }
+                                else {
+                                    avcodec_free_context(&isctx);
+                                    fprintf(stderr,"Found video stream but not able to decode\n");
+                                }
                             }
                         }
 
@@ -387,19 +223,19 @@ public:
             if (eof_stream) break;
             avpkt_release();
             avpkt_init();
-            if (av_read_frame(input_avfmt,&avpkt) < 0) {
+            if (av_read_frame(input_avfmt,avpkt) < 0) {
                 eof_stream = true;
                 return false;
             }
-            if (avpkt.stream_index >= input_avfmt->nb_streams)
+            if (avpkt->stream_index >= input_avfmt->nb_streams)
                 continue;
 
             // ugh... this can happen if the source is an AVI file
-            if (avpkt.pts == AV_NOPTS_VALUE) avpkt.pts = avpkt.dts;
+            if (avpkt->pts == AV_NOPTS_VALUE) avpkt->pts = avpkt->dts;
 
             /* track time and keep things monotonic for our code */
-            if (avpkt.pts != AV_NOPTS_VALUE) {
-                t = avpkt.pts * av_q2d(input_avfmt->streams[avpkt.stream_index]->time_base);
+            if (avpkt->pts != AV_NOPTS_VALUE) {
+                t = avpkt->pts * av_q2d(input_avfmt->streams[avpkt->stream_index]->time_base);
 
                 if (pt < 0)
                     adj_time = -t;
@@ -418,30 +254,30 @@ public:
             if (pt < 0)
                 continue;
 
-            if (avpkt.pts != AV_NOPTS_VALUE) {
-                avpkt.pts += (adj_time * input_avfmt->streams[avpkt.stream_index]->time_base.den) /
-                    input_avfmt->streams[avpkt.stream_index]->time_base.num;
+            if (avpkt->pts != AV_NOPTS_VALUE) {
+                avpkt->pts += (adj_time * input_avfmt->streams[avpkt->stream_index]->time_base.den) /
+                    input_avfmt->streams[avpkt->stream_index]->time_base.num;
             }
 
-            if (avpkt.dts != AV_NOPTS_VALUE) {
-                avpkt.dts += (adj_time * input_avfmt->streams[avpkt.stream_index]->time_base.den) /
-                    input_avfmt->streams[avpkt.stream_index]->time_base.num;
+            if (avpkt->dts != AV_NOPTS_VALUE) {
+                avpkt->dts += (adj_time * input_avfmt->streams[avpkt->stream_index]->time_base.den) /
+                    input_avfmt->streams[avpkt->stream_index]->time_base.num;
             }
 
             got_audio = false;
             got_video = false;
-			if (input_avstream_audio != NULL && avpkt.stream_index == input_avstream_audio->index) {
+			if (input_avstream_audio != NULL && avpkt->stream_index == input_avstream_audio->index) {
                 if (got_audio) fprintf(stderr,"Audio content lost\n");
-				av_packet_rescale_ts(&avpkt,input_avstream_audio->time_base,output_avstream_audio->time_base);
-                handle_audio(/*&*/avpkt);
+				av_packet_rescale_ts(avpkt,input_avstream_audio->time_base,output_avstream_audio->time_base);
+                handle_audio(avpkt);
                 got_audio = true;
                 break;
 			}
-			else if (input_avstream_video != NULL && avpkt.stream_index == input_avstream_video->index) {
+			else if (input_avstream_video != NULL && avpkt->stream_index == input_avstream_video->index) {
                 if (got_video) fprintf(stderr,"Video content lost\n");
 				AVRational m = (AVRational){output_field_rate.den, output_field_rate.num};
-				av_packet_rescale_ts(&avpkt,input_avstream_video->time_base,m); // convert to FIELD number
-                handle_frame(/*&*/avpkt); // will set got_video
+				av_packet_rescale_ts(avpkt,input_avstream_video->time_base,m); // convert to FIELD number
+                handle_frame(avpkt); // will set got_video
                 break;
 			}
 
@@ -450,48 +286,44 @@ public:
 
         if (eof_stream) {
             avpkt_release();
-            avpkt.size = 0;
-            avpkt.data = NULL;
-            handle_frame(/*&*/avpkt); // will set got_video
+            // Send NULL packet to flush decoder
+            handle_frame(NULL); // will set got_video
             if (!got_video) eof = true;
             else fprintf(stderr,"Got latent frame\n");
         }
 
         return true;
     }
-    void handle_audio(AVPacket &pkt) {
-        int got_frame = 0;
-
-        if (avcodec_decode_audio4(input_avstream_audio_codec_context,input_avstream_audio_frame,&got_frame,&pkt) >= 0) {
-            if (got_frame != 0 && input_avstream_audio_frame->nb_samples != 0) {
-                if (input_avstream_audio_frame->pts == AV_NOPTS_VALUE)
-                    input_avstream_audio_frame->pts = pkt.pts;
+    void handle_audio(AVPacket *pkt) {
+        if (avcodec_send_packet(input_avstream_audio_codec_context, pkt) >= 0) {
+            while (avcodec_receive_frame(input_avstream_audio_codec_context, input_avstream_audio_frame) >= 0) {
+                if (input_avstream_audio_frame->nb_samples != 0) {
+                    if (input_avstream_audio_frame->pts == AV_NOPTS_VALUE)
+                        input_avstream_audio_frame->pts = pkt->pts;
 
                 if (input_avstream_audio_resampler != NULL) {
                     if (input_avstream_audio_resampler_rate != input_avstream_audio_codec_context->sample_rate ||
-                            input_avstream_audio_resampler_channels != input_avstream_audio_codec_context->channels) {
+                            input_avstream_audio_resampler_channels != input_avstream_audio_codec_context->ch_layout.nb_channels) {
                         fprintf(stderr,"Audio format changed\n");
                         swr_free(&input_avstream_audio_resampler);
                     }
                 }
 
                 if (input_avstream_audio_resampler == NULL) {
-                    input_avstream_audio_resampler = swr_alloc();
-                    av_opt_set_int(input_avstream_audio_resampler, "in_channel_count", input_avstream_audio_codec_context->channels, 0); // FIXME: FFMPEG should document this!!
-                    av_opt_set_int(input_avstream_audio_resampler, "out_channel_count", output_avstream_audio_codec_context->channels, 0); // FIXME: FFMPEG should document this!!
-                    av_opt_set_int(input_avstream_audio_resampler, "in_channel_layout", input_avstream_audio_codec_context->channel_layout, 0);
-                    av_opt_set_int(input_avstream_audio_resampler, "out_channel_layout", output_avstream_audio_codec_context->channel_layout, 0);
-                    av_opt_set_int(input_avstream_audio_resampler, "in_sample_rate", input_avstream_audio_codec_context->sample_rate, 0);
-                    av_opt_set_int(input_avstream_audio_resampler, "out_sample_rate", output_avstream_audio_codec_context->sample_rate, 0);
-                    av_opt_set_sample_fmt(input_avstream_audio_resampler, "in_sample_fmt", input_avstream_audio_codec_context->sample_fmt, 0);
-                    av_opt_set_sample_fmt(input_avstream_audio_resampler, "out_sample_fmt", output_avstream_audio_codec_context->sample_fmt, 0);
-                    if (swr_init(input_avstream_audio_resampler) < 0) {
+                    if (swr_alloc_set_opts2(&input_avstream_audio_resampler,
+                            &output_avstream_audio_codec_context->ch_layout,
+                            output_avstream_audio_codec_context->sample_fmt,
+                            output_avstream_audio_codec_context->sample_rate,
+                            &input_avstream_audio_codec_context->ch_layout,
+                            input_avstream_audio_codec_context->sample_fmt,
+                            input_avstream_audio_codec_context->sample_rate,
+                            0, NULL) < 0 || swr_init(input_avstream_audio_resampler) < 0) {
                         fprintf(stderr,"Failed to init audio resampler\n");
                         swr_free(&input_avstream_audio_resampler);
                         return;
                     }
                     input_avstream_audio_resampler_rate = input_avstream_audio_codec_context->sample_rate;
-                    input_avstream_audio_resampler_channels = input_avstream_audio_codec_context->channels;
+                    input_avstream_audio_resampler_channels = input_avstream_audio_codec_context->ch_layout.nb_channels;
 
                     if (audio_dst_data != NULL) {
                         av_freep(&audio_dst_data[0]); // NTS: Why??
@@ -517,7 +349,7 @@ public:
                     audio_dst_data_alloc_samples = 0;
                     fprintf(stderr,"Allocating audio buffer %u samples\n",(unsigned int)audio_dst_data_samples);
                     if (av_samples_alloc_array_and_samples(&audio_dst_data,&audio_dst_data_linesize,
-                                output_avstream_audio_codec_context->channels,audio_dst_data_samples,
+                                output_avstream_audio_codec_context->ch_layout.nb_channels,audio_dst_data_samples,
                                 output_avstream_audio_codec_context->sample_fmt, 0) >= 0) {
                         audio_dst_data_alloc_samples = audio_dst_data_samples;
                     }
@@ -538,8 +370,9 @@ public:
                     audio_dst_data_out_audio_sample = audio_sample;
                     audio_sample += audio_dst_data_out_samples;
                 }
-            }
-        }
+                } // if (nb_samples != 0)
+            } // while (avcodec_receive_frame)
+        } // if (avcodec_send_packet)
     }
     void frame_copy_scale(void) {
         if (input_avstream_video_frame_rgb == NULL) {
@@ -595,10 +428,8 @@ public:
 
         if (input_avstream_video_resampler != NULL) {
             input_avstream_video_frame_rgb->pts = input_avstream_video_frame->pts;
-            input_avstream_video_frame_rgb->pkt_pts = input_avstream_video_frame->pkt_pts;
-            input_avstream_video_frame_rgb->pkt_dts = input_avstream_video_frame->pkt_dts;
-            input_avstream_video_frame_rgb->top_field_first = input_avstream_video_frame->top_field_first;
-            input_avstream_video_frame_rgb->interlaced_frame = input_avstream_video_frame->interlaced_frame;
+            input_avstream_video_frame_rgb->flags = (input_avstream_video_frame_rgb->flags & ~(AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED)) |
+                (input_avstream_video_frame->flags & (AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED));
 
             if (sws_scale(input_avstream_video_resampler,
                         // source
@@ -611,12 +442,12 @@ public:
                 fprintf(stderr,"WARNING: sws_scale failed\n");
         }
     }
-    void handle_frame(AVPacket &pkt) {
-        int got_frame = 0;
-
-        if (avcodec_decode_video2(input_avstream_video_codec_context,input_avstream_video_frame,&got_frame,&pkt) >= 0) {
-            if (got_frame != 0 && input_avstream_video_frame->width > 0 && input_avstream_video_frame->height > 0) {
-                got_video = true;
+    void handle_frame(AVPacket *pkt) {
+        if (avcodec_send_packet(input_avstream_video_codec_context, pkt) >= 0) {
+            if (avcodec_receive_frame(input_avstream_video_codec_context, input_avstream_video_frame) >= 0) {
+                if (input_avstream_video_frame->width > 0 && input_avstream_video_frame->height > 0) {
+                    got_video = true;
+                }
             }
         }
         else {
@@ -624,15 +455,13 @@ public:
         }
     }
     void avpkt_init(void) {
-        if (!avpkt_valid) {
-            avpkt_valid = true;
-            av_init_packet(&avpkt);
+        if (avpkt == NULL) {
+            avpkt = av_packet_alloc();
         }
     }
     void avpkt_release(void) {
-        if (avpkt_valid) {
-            avpkt_valid = false;
-            av_packet_unref(&avpkt);
+        if (avpkt != NULL) {
+            av_packet_free(&avpkt);
         }
         got_audio = false;
         got_video = false;
@@ -641,13 +470,11 @@ public:
         eof = true;
         avpkt_release();
         if (input_avstream_audio_codec_context != NULL) {
-            avcodec_close(input_avstream_audio_codec_context);
-            input_avstream_audio_codec_context = NULL;
+            avcodec_free_context(&input_avstream_audio_codec_context);
             input_avstream_audio = NULL;
         }
         if (input_avstream_video_codec_context != NULL) {
-            avcodec_close(input_avstream_video_codec_context);
-            input_avstream_video_codec_context = NULL;
+            avcodec_free_context(&input_avstream_video_codec_context);
             input_avstream_video = NULL;
         }
 
@@ -707,8 +534,7 @@ public:
     int                     input_avstream_video_resampler_width;
     signed long long        next_pts;
     signed long long        next_dts;
-    AVPacket                avpkt;
-    bool                    avpkt_valid;
+    AVPacket*               avpkt;
     double                  adj_time;
     double                  t,pt;
 };
@@ -744,8 +570,6 @@ InputFile &new_input_file(void) {
 
     return current_input_file();
 }
-
-volatile int DIE = 0;
 
 HiLoComboPass		audio_hilopass;
 
@@ -808,10 +632,6 @@ enum {
 
 int		output_vhs_tape_speed = VHS_SP;
 
-void sigma(int x) {
-	if (++DIE >= 20) abort();
-}
-
 void preset_PAL() {
 	output_field_rate.num = 50;
 	output_field_rate.den = 1;
@@ -846,8 +666,8 @@ static void help(const char *arg0) {
 	fprintf(stderr," -subcarrier-amp <0...100> Subcarrier amplitude (0 to 100 percent of luma)\n");
 	fprintf(stderr," -noise <0..100>           Noise amplitude\n");
 	fprintf(stderr," -chroma-noise <0..100>    Chroma noise amplitude\n");
-	fprintf(stderr," -audio-hiss <-120..0>     Audio hiss in decibels (0=100%)\n");
-	fprintf(stderr," -vhs-linear-video-crosstalk <x> Emulate video crosstalk in audio. Loudness in dBFS (0=100%)\n");
+	fprintf(stderr," -audio-hiss <-120..0>     Audio hiss in decibels (0=100%%)\n");
+	fprintf(stderr," -vhs-linear-video-crosstalk <x> Emulate video crosstalk in audio. Loudness in dBFS (0=100%%)\n");
 	fprintf(stderr," -chroma-phase-noise <x>   Chroma phase noise (0...100)\n");
 	fprintf(stderr," -vhs-chroma-vblend <0|1>  Vertically blend chroma scanlines (as VHS format does)\n");
 	fprintf(stderr," -vhs-svideo <0|1>         Render VHS as if S-Video (luma and chroma separate out of VHS)\n");
@@ -1300,20 +1120,21 @@ void write_out_audio(InputFile &fin) {
         if (out_samples > output_audio_rate)
             out_samples = output_audio_rate;
 
-        AVPacket dstpkt;
-        av_init_packet(&dstpkt);
-        if (av_new_packet(&dstpkt,out_samples * 2 * output_audio_channels) >= 0) { // NTS: Will reset fields too!
-            assert(dstpkt.data != NULL);
-            assert(dstpkt.size >= (out_samples * 2 * output_audio_channels));
-            memset(dstpkt.data,0,out_samples * 2 * output_audio_channels);
+        AVPacket *dstpkt = av_packet_alloc();
+        if (dstpkt != NULL) {
+            if (av_new_packet(dstpkt,out_samples * 2 * output_audio_channels) >= 0) { // NTS: Will reset fields too!
+                assert(dstpkt->data != NULL);
+                assert(dstpkt->size >= (out_samples * 2 * output_audio_channels));
+                memset(dstpkt->data,0,out_samples * 2 * output_audio_channels);
+            }
+            dstpkt->pts = fin.last_written_sample;
+            dstpkt->dts = fin.last_written_sample;
+            dstpkt->stream_index = output_avstream_audio->index;
+            av_packet_rescale_ts(dstpkt,output_avstream_audio_codec_context->time_base,output_avstream_audio->time_base);
+            if (av_interleaved_write_frame(output_avfmt,dstpkt) < 0)
+                fprintf(stderr,"Failed to write frame\n");
+            av_packet_free(&dstpkt);
         }
-        dstpkt.pts = fin.last_written_sample;
-        dstpkt.dts = fin.last_written_sample;
-        dstpkt.stream_index = output_avstream_audio->index;
-        av_packet_rescale_ts(&dstpkt,output_avstream_audio_codec_context->time_base,output_avstream_audio->time_base);
-        if (av_interleaved_write_frame(output_avfmt,&dstpkt) < 0)
-            fprintf(stderr,"Failed to write frame\n");
-        av_packet_unref(&dstpkt);
 
         fprintf(stderr,"Pad fill %llu samples\n",out_samples);
         fin.last_written_sample += out_samples;
@@ -1321,78 +1142,23 @@ void write_out_audio(InputFile &fin) {
 
     // write it out. TODO: At some point, support conversion to whatever the codec needs and then convert to it.
     // that way we can render directly to MP4 our VHS emulation.
-    AVPacket dstpkt;
-    av_init_packet(&dstpkt);
-    if (av_new_packet(&dstpkt,fin.audio_dst_data_out_samples * 2 * output_audio_channels) >= 0) { // NTS: Will reset fields too!
-        assert(dstpkt.data != NULL);
-        assert(dstpkt.size >= (fin.audio_dst_data_out_samples * 2 * output_audio_channels));
-        memcpy(dstpkt.data,fin.audio_dst_data[0],fin.audio_dst_data_out_samples * 2 * output_audio_channels);
+    AVPacket *dstpkt = av_packet_alloc();
+    if (dstpkt != NULL) {
+        if (av_new_packet(dstpkt,fin.audio_dst_data_out_samples * 2 * output_audio_channels) >= 0) { // NTS: Will reset fields too!
+            assert(dstpkt->data != NULL);
+            assert(dstpkt->size >= (fin.audio_dst_data_out_samples * 2 * output_audio_channels));
+            memcpy(dstpkt->data,fin.audio_dst_data[0],fin.audio_dst_data_out_samples * 2 * output_audio_channels);
+        }
+        dstpkt->pts = fin.audio_dst_data_out_audio_sample;
+        dstpkt->dts = fin.audio_dst_data_out_audio_sample;
+        dstpkt->stream_index = output_avstream_audio->index;
+        av_packet_rescale_ts(dstpkt,output_avstream_audio_codec_context->time_base,output_avstream_audio->time_base);
+        if (av_interleaved_write_frame(output_avfmt,dstpkt) < 0)
+            fprintf(stderr,"Failed to write frame\n");
+        av_packet_free(&dstpkt);
     }
-    dstpkt.pts = fin.audio_dst_data_out_audio_sample;
-    dstpkt.dts = fin.audio_dst_data_out_audio_sample;
-    dstpkt.stream_index = output_avstream_audio->index;
-    av_packet_rescale_ts(&dstpkt,output_avstream_audio_codec_context->time_base,output_avstream_audio->time_base);
-    if (av_interleaved_write_frame(output_avfmt,&dstpkt) < 0)
-        fprintf(stderr,"Failed to write frame\n");
-    av_packet_unref(&dstpkt);
 
     fin.audio_sample = fin.last_written_sample = fin.audio_dst_data_out_audio_sample + fin.audio_dst_data_out_samples;
-}
-
-void output_frame(AVFrame *frame,unsigned long long field_number) {
-	int gotit = 0;
-	AVPacket pkt;
-
-	av_init_packet(&pkt);
-	if (av_new_packet(&pkt,50000000/8) < 0) {
-		fprintf(stderr,"Failed to alloc vid packet\n");
-		return;
-	}
-
-	frame->key_frame = (field_number % (15ULL * 2ULL)) == 0 ? 1 : 0;
-
-    {
-		frame->interlaced_frame = 0;
-		frame->pts = field_number;
-		pkt.pts = field_number;
-		pkt.dts = field_number;
-	}
-
-	fprintf(stderr,"\x0D" "Output field %llu ",field_number); fflush(stderr);
-    if (avcodec_encode_video2(output_avstream_video_codec_context,&pkt,frame,&gotit) == 0) {
-        if (gotit) {
-            pkt.stream_index = output_avstream_video->index;
-            av_packet_rescale_ts(&pkt,output_avstream_video_codec_context->time_base,output_avstream_video->time_base);
-
-            if (av_interleaved_write_frame(output_avfmt,&pkt) < 0)
-                fprintf(stderr,"AV write frame failed video\n");
-        }
-    }
-
-	av_packet_unref(&pkt);
-}
-
-void RGB_to_YIQ(int &Y,int &I,int &Q,int r,int g,int b) {
-    double dY;
-
-    dY = (0.30 * r) + (0.59 * g) + (0.11 * b);
-
-    Y = (int)(256 * dY);
-    I = (int)(256 * ((-0.27 * (b - dY)) + ( 0.74 * (r - dY))));
-    Q = (int)(256 * (( 0.41 * (b - dY)) + ( 0.48 * (r - dY))));
-}
-
-void YIQ_to_RGB(int &r,int &g,int &b,int Y,int I,int Q) {
-    // FIXME
-    r = (int)((( 1.000 * Y) + ( 0.956 * I) + ( 0.621 * Q)) / 256);
-    g = (int)((( 1.000 * Y) + (-0.272 * I) + (-0.647 * Q)) / 256);
-    b = (int)((( 1.000 * Y) + (-1.106 * I) + ( 1.703 * Q)) / 256);
-    if (r < 0) r = 0;
-    else if (r > 255) r = 255;
-    if (g < 0) g = 0;
-    else if (g > 255) g = 255;
-    if (b < 0) b = 0;
-    else if (b > 255) b = 255;
 }
 
 /* lighter-weight filtering, probably what your old CRT does to reduce color fringes a bit */
@@ -1582,8 +1348,8 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
     if (dstframe->width != srcframe->width) return;
     if (dstframe->height != srcframe->height) return;
 
-    if (srcframe->interlaced_frame)
-        opposite = (srcframe->top_field_first ? 1 : 0);
+    if (srcframe->flags & AV_FRAME_FLAG_INTERLACED)
+        opposite = (srcframe->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 0;
     else
         opposite = 0;
 
@@ -1920,14 +1686,68 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
     delete[] fQ;
 }
 
+#ifdef HAVE_CUDA
+// Helper function: Process a completed GPU frame (deinterlace + scale + encode)
+// Called after ntsc_cuda_wait_async() returns, when gpu_output_frame[buf_idx] is ready.
+// This function copies the GPU result to the output frame buffer, applies deinterlacing,
+// converts to encode format, and writes the frame.
+static void process_completed_gpu_frame(int buf_idx, size_t frame_idx, signed long long fieldno) {
+    AVFrame* gpu_frame = gpu_pipeline.gpu_output_frame[buf_idx];
+    AVFrame* out_frame = output_avstream_video_frame[frame_idx];
+    
+    // Copy GPU output to the output frame buffer
+    // (GPU wrote to gpu_output_frame, but encoding pipeline expects output_avstream_video_frame)
+    if (gpu_frame != out_frame) {
+        // Copy the BGRA data
+        for (int y = 0; y < gpu_frame->height; y++) {
+            memcpy(out_frame->data[0] + out_frame->linesize[0] * y,
+                   gpu_frame->data[0] + gpu_frame->linesize[0] * y,
+                   gpu_frame->width * 4);
+        }
+        out_frame->pts = gpu_frame->pts;
+        out_frame->flags = gpu_frame->flags;
+    }
+    
+    // Field deinterlace
+    unsigned int field = (fieldno & 1) ^ 1;
+    
+    if (field) {
+        for (unsigned int y = field; y < out_frame->height; y += 2) {
+            uint32_t *d = (uint32_t*)(out_frame->data[0] + (out_frame->linesize[0] * (y - 1)));
+            uint32_t *s = (uint32_t*)(out_frame->data[0] + (out_frame->linesize[0] * y));
+            memcpy(d, s, sizeof(uint32_t) * out_frame->width);
+        }
+    } else {
+        for (unsigned int y = 1; (y + 1) < out_frame->height; y += 2) {
+            uint32_t *d = (uint32_t*)(out_frame->data[0] + (out_frame->linesize[0] * y));
+            uint32_t *s = (uint32_t*)(out_frame->data[0] + (out_frame->linesize[0] * (y + 1)));
+            memcpy(d, s, sizeof(uint32_t) * out_frame->width);
+        }
+    }
+    
+    // Convert ARGB to codec format and encode
+    output_avstream_video_encode_frame->pts = out_frame->pts;
+    output_avstream_video_encode_frame->flags = 
+        (output_avstream_video_encode_frame->flags & ~(AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED)) |
+        (out_frame->flags & (AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED));
+    
+    if (sws_scale(output_avstream_video_resampler,
+                  out_frame->data, out_frame->linesize,
+                  0, out_frame->height,
+                  output_avstream_video_encode_frame->data,
+                  output_avstream_video_encode_frame->linesize) <= 0)
+        fprintf(stderr, "WARNING: sws_scale failed\n");
+    
+    output_frame(output_avstream_video_encode_frame, fieldno);
+}
+#endif
+
 int main(int argc,char **argv) {
     preset_NTSC();
     if (parse_argv(argc,argv))
 		return 1;
 
-	av_register_all();
-	avformat_network_init();
-	avcodec_register_all();
+	// av_register_all(), avformat_network_init(), avcodec_register_all() removed — unnecessary in FFmpeg 4+
 
     /* open all input files */
     for (std::vector<InputFile>::iterator i=input_files.begin();i!=input_files.end();i++) {
@@ -1951,19 +1771,15 @@ int main(int argc,char **argv) {
 			return 1;
 		}
 
-		output_avstream_audio_codec_context = output_avstream_audio->codec;
+		output_avstream_audio_codec_context = avcodec_alloc_context3(avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE));
 		if (output_avstream_audio_codec_context == NULL) {
 			fprintf(stderr,"Output stream audio no codec context?\n");
 			return 1;
 		}
 
-		if (output_audio_channels == 2)
-			output_avstream_audio_codec_context->channel_layout = AV_CH_LAYOUT_STEREO;
-		else
-			output_avstream_audio_codec_context->channel_layout = AV_CH_LAYOUT_MONO;
+		av_channel_layout_default(&output_avstream_audio_codec_context->ch_layout, output_audio_channels);
 
 		output_avstream_audio_codec_context->sample_rate = output_audio_rate;
-		output_avstream_audio_codec_context->channels = output_audio_channels;
 		output_avstream_audio_codec_context->sample_fmt = AV_SAMPLE_FMT_S16;
 		output_avstream_audio_codec_context->time_base = (AVRational){1, output_audio_rate};
 		output_avstream_audio->time_base = output_avstream_audio_codec_context->time_base;
@@ -1975,6 +1791,11 @@ int main(int argc,char **argv) {
 			fprintf(stderr,"Output stream cannot open codec\n");
 			return 1;
 		}
+
+		if (avcodec_parameters_from_context(output_avstream_audio->codecpar, output_avstream_audio_codec_context) < 0) {
+			fprintf(stderr,"Failed to copy audio codec parameters to stream\n");
+			return 1;
+		}
 	}
 
 	{
@@ -1984,14 +1805,12 @@ int main(int argc,char **argv) {
 			return 1;
 		}
 
-		output_avstream_video_codec_context = output_avstream_video->codec;
+		output_avstream_video_codec_context = avcodec_alloc_context3(avcodec_find_encoder(AV_CODEC_ID_H264));
 		if (output_avstream_video_codec_context == NULL) {
 			fprintf(stderr,"Output stream video no codec context?\n");
 			return 1;
 		}
 
-		// FIXME: How do I get FFMPEG to write raw YUV 4:2:2?
-		avcodec_get_context_defaults3(output_avstream_video_codec_context,avcodec_find_encoder(AV_CODEC_ID_H264));
 		output_avstream_video_codec_context->width = output_width;
 		output_avstream_video_codec_context->height = output_height;
 		output_avstream_video_codec_context->sample_aspect_ratio = (AVRational){output_height*4, output_width*3};
@@ -2006,6 +1825,11 @@ int main(int argc,char **argv) {
 
 		if (avcodec_open2(output_avstream_video_codec_context,avcodec_find_encoder(AV_CODEC_ID_H264),NULL) < 0) {
 			fprintf(stderr,"Output stream cannot open codec\n");
+			return 1;
+		}
+
+		if (avcodec_parameters_from_context(output_avstream_video->codecpar, output_avstream_video_codec_context) < 0) {
+			fprintf(stderr,"Failed to copy video codec parameters to stream\n");
 			return 1;
 		}
 	}
@@ -2023,10 +1847,38 @@ int main(int argc,char **argv) {
 	}
 
 	/* soft break on CTRL+C */
-	signal(SIGINT,sigma);
-	signal(SIGHUP,sigma);
-	signal(SIGQUIT,sigma);
-	signal(SIGTERM,sigma);
+	install_signal_handlers();
+
+#ifdef HAVE_CUDA
+	cuda_available = ntsc_cuda_init(output_width, output_height);
+	if (cuda_available) {
+		fprintf(stderr, "NTSC CUDA acceleration enabled (double-buffered async pipeline)\n");
+		
+		// Allocate GPU output frames for double-buffering
+		for (int i = 0; i < NTSC_CUDA_NUM_BUFFERS; i++) {
+			gpu_pipeline.gpu_output_frame[i] = av_frame_alloc();
+			if (gpu_pipeline.gpu_output_frame[i] == NULL) {
+				fprintf(stderr, "Failed to alloc GPU output frame %d\n", i);
+				cuda_available = false;
+				break;
+			}
+			gpu_pipeline.gpu_output_frame[i]->format = AV_PIX_FMT_BGRA;
+			gpu_pipeline.gpu_output_frame[i]->height = output_height;
+			gpu_pipeline.gpu_output_frame[i]->width = output_width;
+			if (av_frame_get_buffer(gpu_pipeline.gpu_output_frame[i], 64) < 0) {
+				fprintf(stderr, "Failed to alloc GPU output buffer %d\n", i);
+				cuda_available = false;
+				break;
+			}
+			memset(gpu_pipeline.gpu_output_frame[i]->data[0], 0,
+			       gpu_pipeline.gpu_output_frame[i]->linesize[0] * gpu_pipeline.gpu_output_frame[i]->height);
+		}
+		gpu_pipeline.current_buf_idx = 0;
+		gpu_pipeline.has_pending_frame = false;
+	}
+	else
+		fprintf(stderr, "NTSC CUDA init failed, falling back to CPU\n");
+#endif
 
 	/* prepare audio filtering */
 	audio_hilopass.setChannels(output_audio_channels);
@@ -2097,8 +1949,8 @@ int main(int argc,char **argv) {
             fprintf(stderr,"Failed to alloc video frame3\n");
             return 1;
         }
-        av_frame_set_colorspace(output_avstream_video_encode_frame,AVCOL_SPC_SMPTE170M);
-        av_frame_set_color_range(output_avstream_video_encode_frame,AVCOL_RANGE_MPEG);
+        output_avstream_video_encode_frame->colorspace = AVCOL_SPC_SMPTE170M;
+        output_avstream_video_encode_frame->color_range = AVCOL_RANGE_MPEG;
         output_avstream_video_encode_frame->format = output_avstream_video_codec_context->pix_fmt;
         output_avstream_video_encode_frame->height = output_height;
         output_avstream_video_encode_frame->width = output_width;
@@ -2138,6 +1990,7 @@ int main(int argc,char **argv) {
     }
 
     /* run all inputs and render to output, until done */
+    auto processing_start_time = std::chrono::steady_clock::now();
     {
         bool eof,copyaud;
         signed long long upto=0;
@@ -2171,12 +2024,12 @@ int main(int argc,char **argv) {
                 if ((*i).eof == false) {
                     if ((*i).input_avstream_video_frame != NULL) {
                         if ((*i).got_video) {
-                            if ((*i).input_avstream_video_frame->pkt_pts != AV_NOPTS_VALUE) {
-                                if (upto == (-1LL) || upto > (*i).input_avstream_video_frame->pkt_pts)
-                                    upto = (*i).input_avstream_video_frame->pkt_pts;
+                            if ((*i).input_avstream_video_frame->pts != AV_NOPTS_VALUE) {
+                                if (upto == (-1LL) || upto > (*i).input_avstream_video_frame->pts)
+                                    upto = (*i).input_avstream_video_frame->pts;
                             }
 
-                            if ((*i).input_avstream_video_frame->pkt_pts == AV_NOPTS_VALUE || current >= (*i).input_avstream_video_frame->pkt_pts) {
+                            if ((*i).input_avstream_video_frame->pts == AV_NOPTS_VALUE || current >= (*i).input_avstream_video_frame->pts) {
                                 (*i).frame_copy_scale();
                                 (*i).got_video = false;
                             }
@@ -2204,7 +2057,7 @@ int main(int argc,char **argv) {
                     if ((*i).eof == false) {
                         if ((*i).input_avstream_video_frame != NULL) {
                             if ((*i).got_video) {
-                                if ((*i).input_avstream_video_frame->pkt_pts == AV_NOPTS_VALUE || current >= (*i).input_avstream_video_frame->pkt_pts) {
+                                if ((*i).input_avstream_video_frame->pts == AV_NOPTS_VALUE || current >= (*i).input_avstream_video_frame->pts) {
                                     (*i).frame_copy_scale();
                                     (*i).got_video = false;
                                 }
@@ -2226,13 +2079,77 @@ int main(int argc,char **argv) {
                     }
 
                     // composite the layer, keying against the color. all code assumes ARGB
+#ifdef HAVE_CUDA
+                    if (cuda_available && enable_composite_emulation) {
+                        AVFrame *srcframe = (*i).input_avstream_video_frame_rgb;
+                        AVFrame *dstframe = output_avstream_video_frame[output_avstream_video_frame_index];
+                        unsigned int field = (current & 1) ^ 1;
+
+                        if (dstframe != NULL && srcframe != NULL &&
+                            dstframe->data[0] != NULL && srcframe->data[0] != NULL &&
+                            dstframe->width == srcframe->width && dstframe->height == srcframe->height) {
+
+                            NtscCudaParams cp = {};
+                            cp.width = dstframe->width;
+                            cp.height = dstframe->height;
+                            cp.field = field;
+                            cp.fieldno = current;
+                            cp.subcarrier_amplitude = subcarrier_amplitude;
+                            cp.subcarrier_amplitude_back = subcarrier_amplitude_back;
+                            cp.video_scanline_phase_shift = video_scanline_phase_shift;
+                            cp.video_scanline_phase_shift_offset = video_scanline_phase_shift_offset;
+                            cp.video_noise = video_noise;
+                            cp.video_chroma_noise = video_chroma_noise;
+                            cp.video_chroma_phase_noise = video_chroma_phase_noise;
+                            cp.video_chroma_loss = video_chroma_loss;
+                            cp.composite_preemphasis = composite_preemphasis;
+                            cp.composite_preemphasis_cut = composite_preemphasis_cut;
+                            cp.composite_in_chroma_lowpass = composite_in_chroma_lowpass;
+                            cp.composite_out_chroma_lowpass = composite_out_chroma_lowpass;
+                            cp.composite_out_chroma_lowpass_lite = composite_out_chroma_lowpass_lite;
+                            cp.nocolor_subcarrier = nocolor_subcarrier;
+                            cp.nocolor_subcarrier_after_yc_sep = nocolor_subcarrier_after_yc_sep;
+                            cp.enable_composite_emulation = enable_composite_emulation;
+                            cp.emulating_vhs = emulating_vhs;
+                            cp.output_vhs_tape_speed = output_vhs_tape_speed;
+                            cp.vhs_chroma_vert_blend = vhs_chroma_vert_blend;
+                            cp.vhs_svideo_out = vhs_svideo_out;
+                            cp.vhs_out_sharpen = vhs_out_sharpen;
+                            cp.output_ntsc = output_ntsc;
+                            cp.vhs_head_switching = vhs_head_switching;
+                            cp.vhs_head_switching_point = vhs_head_switching_point;
+                            cp.vhs_head_switching_phase = vhs_head_switching_phase;
+                            cp.vhs_head_switching_phase_noise = vhs_head_switching_phase_noise;
+
+                            // Determine interlaced opposite field offset
+                            if (srcframe->flags & AV_FRAME_FLAG_INTERLACED)
+                                cp.opposite = (srcframe->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 0;
+                            else
+                                cp.opposite = 0;
+
+                            // Use synchronous GPU processing - submit and wait immediately
+                            // GPU writes directly to output frame buffer
+                            ntsc_cuda_submit_async(
+                                0,  // always use buffer 0
+                                srcframe->data[0], srcframe->linesize[0],
+                                dstframe->data[0], dstframe->linesize[0],
+                                cp);
+                            ntsc_cuda_wait_async(0);
+                        }
+                        else {
+                            // Fallback to CPU if frame check failed
+                            composite_layer(output_avstream_video_frame[output_avstream_video_frame_index],(*i).input_avstream_video_frame_rgb,*i,(current & 1) ^ 1,current);
+                        }
+                    }
+                    else
+#endif
                     composite_layer(output_avstream_video_frame[output_avstream_video_frame_index],(*i).input_avstream_video_frame_rgb,*i,(current & 1) ^ 1,current);
                 }
 
-                // field deinterlace
                 {
+                    // field deinterlace, scale, and encode
                     unsigned int field = (current & 1) ^ 1;
-                    unsigned int sy,dy,y;
+                    unsigned int y;
 
                     if (field) {
                         for (y=field;y < output_avstream_video_frame[output_avstream_video_frame_index]->height;y += 2) {
@@ -2254,58 +2171,66 @@ int main(int argc,char **argv) {
                             memcpy(d,s,sizeof(uint32_t)*output_avstream_video_frame[output_avstream_video_frame_index]->width);
                         }
                     }
+
+                    // convert ARGB to whatever the codec demands, and encode
+                    output_avstream_video_encode_frame->pts = output_avstream_video_frame[output_avstream_video_frame_index]->pts;
+                    output_avstream_video_encode_frame->flags = (output_avstream_video_encode_frame->flags & ~(AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED)) |
+                        (output_avstream_video_frame[output_avstream_video_frame_index]->flags & (AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED));
+
+                    if (sws_scale(output_avstream_video_resampler,
+                                // source
+                                output_avstream_video_frame[output_avstream_video_frame_index]->data,
+                                output_avstream_video_frame[output_avstream_video_frame_index]->linesize,
+                                0,output_avstream_video_frame[output_avstream_video_frame_index]->height,
+                                // dest
+                                output_avstream_video_encode_frame->data,
+                                output_avstream_video_encode_frame->linesize) <= 0)
+                        fprintf(stderr,"WARNING: sws_scale failed\n");
+
+                    assert(output_avstream_video_frame_index < output_avstream_video_frame.size());
+                    if ((++output_avstream_video_frame_index) >= output_avstream_video_frame_delay)
+                        output_avstream_video_frame_index = 0;
+
+                    output_frame(output_avstream_video_encode_frame,current);
+                    current++;
                 }
-
-                // convert ARGB to whatever the codec demands, and encode
-                output_avstream_video_encode_frame->pts = output_avstream_video_frame[output_avstream_video_frame_index]->pts;
-                output_avstream_video_encode_frame->pkt_pts = output_avstream_video_frame[output_avstream_video_frame_index]->pkt_pts;
-                output_avstream_video_encode_frame->pkt_dts = output_avstream_video_frame[output_avstream_video_frame_index]->pkt_dts;
-                output_avstream_video_encode_frame->top_field_first = output_avstream_video_frame[output_avstream_video_frame_index]->top_field_first;
-                output_avstream_video_encode_frame->interlaced_frame = output_avstream_video_frame[output_avstream_video_frame_index]->interlaced_frame;
-
-                if (sws_scale(output_avstream_video_resampler,
-                            // source
-                            output_avstream_video_frame[output_avstream_video_frame_index]->data,
-                            output_avstream_video_frame[output_avstream_video_frame_index]->linesize,
-                            0,output_avstream_video_frame[output_avstream_video_frame_index]->height,
-                            // dest
-                            output_avstream_video_encode_frame->data,
-                            output_avstream_video_encode_frame->linesize) <= 0)
-                    fprintf(stderr,"WARNING: sws_scale failed\n");
-
-                assert(output_avstream_video_frame_index < output_avstream_video_frame.size());
-                if ((++output_avstream_video_frame_index) >= output_avstream_video_frame_delay)
-                    output_avstream_video_frame_index = 0;
-
-                output_frame(output_avstream_video_encode_frame,current);
-                current++;
             }
         } while (!eof);
     }
 
+    auto processing_end_time = std::chrono::steady_clock::now();
+    auto processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end_time - processing_start_time);
+    fprintf(stderr, "\nProcessing time: %.3f seconds\n", processing_duration.count() / 1000.0);
+
     /* flush encoder delay */
-    do {
-        AVPacket pkt;
-        int gotit=0;
+    avcodec_send_frame(output_avstream_video_codec_context, NULL); // signal end of stream
+    {
+        AVPacket *pkt = av_packet_alloc();
+        if (pkt != NULL) {
+            while (avcodec_receive_packet(output_avstream_video_codec_context, pkt) >= 0) {
+                pkt->stream_index = output_avstream_video->index;
+                av_packet_rescale_ts(pkt, output_avstream_video_codec_context->time_base, output_avstream_video->time_base);
 
-        av_init_packet(&pkt);
-        if (av_new_packet(&pkt,50000000/8) < 0) break;
-
-        if (avcodec_encode_video2(output_avstream_video_codec_context,&pkt,NULL,&gotit) == 0) {
-            if (gotit) {
-                pkt.stream_index = output_avstream_video->index;
-                av_packet_rescale_ts(&pkt,output_avstream_video_codec_context->time_base,output_avstream_video->time_base);
-
-                if (av_interleaved_write_frame(output_avfmt,&pkt) < 0)
+                if (av_interleaved_write_frame(output_avfmt, pkt) < 0)
                     fprintf(stderr,"AV write frame failed video\n");
+                av_packet_unref(pkt);
             }
+            av_packet_free(&pkt);
         }
-
-        av_packet_unref(&pkt);
-        if (!gotit) break;
-    } while (1);
+    }
 
     /* close output */
+#ifdef HAVE_CUDA
+    if (cuda_available) {
+        ntsc_cuda_shutdown();
+        // Free GPU output frames
+        for (int i = 0; i < NTSC_CUDA_NUM_BUFFERS; i++) {
+            if (gpu_pipeline.gpu_output_frame[i] != NULL) {
+                av_frame_free(&gpu_pipeline.gpu_output_frame[i]);
+            }
+        }
+    }
+#endif
     if (output_avstream_video_resampler != NULL) {
         sws_freeContext(output_avstream_video_resampler);
         output_avstream_video_resampler = NULL;
@@ -2319,6 +2244,10 @@ int main(int argc,char **argv) {
     }
 	audio_hilopass.clear();
 	av_write_trailer(output_avfmt);
+	if (output_avstream_video_codec_context != NULL)
+		avcodec_free_context(&output_avstream_video_codec_context);
+	if (output_avstream_audio_codec_context != NULL)
+		avcodec_free_context(&output_avstream_audio_codec_context);
 	if (output_avfmt != NULL && !(output_avfmt->oformat->flags & AVFMT_NOFILE))
 		avio_closep(&output_avfmt->pb);
 	avformat_free_context(output_avfmt);
