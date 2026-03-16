@@ -4,6 +4,12 @@
 //      The "posterize" we emulate here is more the type where you run the video through an ADC, truncate the least significant
 //      bits, then run back through a DAC on the other side (well within the realm of 1980s/1990s hardware)
 
+// Platform headers (before FFmpeg to avoid type conflicts)
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include "common.h"
 #include "lowpass_filter.h"
 #include "color_convert.h"
@@ -1875,6 +1881,12 @@ int main(int argc,char **argv) {
 		}
 		gpu_pipeline.current_buf_idx = 0;
 		gpu_pipeline.has_pending_frame = false;
+		
+		// Mildly elevate process priority for better GPU scheduling latency.
+		// ABOVE_NORMAL is a light hint — does NOT monopolize the GPU.
+#ifdef _WIN32
+		SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+#endif
 	}
 	else
 		fprintf(stderr, "NTSC CUDA init failed, falling back to CPU\n");
@@ -2127,14 +2139,42 @@ int main(int argc,char **argv) {
                             else
                                 cp.opposite = 0;
 
-                            // Use synchronous GPU processing - submit and wait immediately
-                            // GPU writes directly to output frame buffer
+                            // ── Double-buffered async GPU pipeline ──
+                            // 1. Submit current frame to GPU (starts processing immediately)
+                            int cur_buf = gpu_pipeline.current_buf_idx;
+                            AVFrame *gpu_frame = gpu_pipeline.gpu_output_frame[cur_buf];
+                            gpu_frame->pts = dstframe->pts;
+                            gpu_frame->flags = dstframe->flags;
                             ntsc_cuda_submit_async(
-                                0,  // always use buffer 0
+                                cur_buf,
                                 srcframe->data[0], srcframe->linesize[0],
-                                dstframe->data[0], dstframe->linesize[0],
+                                gpu_frame->data[0], gpu_frame->linesize[0],
                                 cp);
-                            ntsc_cuda_wait_async(0);
+
+                            // 2. While GPU works on current frame, process previous frame's result
+                            if (gpu_pipeline.has_pending_frame) {
+                                ntsc_cuda_wait_async(gpu_pipeline.pending_buf_idx);
+                                process_completed_gpu_frame(
+                                    gpu_pipeline.pending_buf_idx,
+                                    gpu_pipeline.pending_frame_idx,
+                                    gpu_pipeline.pending_fieldno);
+                                // Advance frame index (matches original loop logic)
+                                assert(gpu_pipeline.pending_frame_idx < output_avstream_video_frame.size());
+                                if ((++output_avstream_video_frame_index) >= output_avstream_video_frame_delay)
+                                    output_avstream_video_frame_index = 0;
+                            }
+
+                            // 3. Mark current frame as pending for next iteration
+                            gpu_pipeline.has_pending_frame = true;
+                            gpu_pipeline.pending_buf_idx = cur_buf;
+                            gpu_pipeline.pending_fieldno = current;
+                            gpu_pipeline.pending_frame_idx = output_avstream_video_frame_index;
+                            gpu_pipeline.current_buf_idx = (cur_buf + 1) % NTSC_CUDA_NUM_BUFFERS;
+
+                            // Skip the normal deinterlace+encode block below — it will be done
+                            // when we process this pending frame next iteration (or at flush).
+                            current++;
+                            goto cuda_skip_encode;
                         }
                         else {
                             // Fallback to CPU if frame check failed
@@ -2194,9 +2234,24 @@ int main(int argc,char **argv) {
                     output_frame(output_avstream_video_encode_frame,current);
                     current++;
                 }
+#ifdef HAVE_CUDA
+                cuda_skip_encode: ;
+#endif
             }
         } while (!eof);
     }
+
+#ifdef HAVE_CUDA
+    // Flush the last pending GPU frame (the pipeline always has one frame in flight)
+    if (cuda_available && gpu_pipeline.has_pending_frame) {
+        ntsc_cuda_wait_async(gpu_pipeline.pending_buf_idx);
+        process_completed_gpu_frame(
+            gpu_pipeline.pending_buf_idx,
+            gpu_pipeline.pending_frame_idx,
+            gpu_pipeline.pending_fieldno);
+        gpu_pipeline.has_pending_frame = false;
+    }
+#endif
 
     auto processing_end_time = std::chrono::steady_clock::now();
     auto processing_duration = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end_time - processing_start_time);

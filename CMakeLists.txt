@@ -31,13 +31,11 @@ else()
 endif()
 
 # ─── Find FFmpeg via pkg-config ──────────────────────────────────────────────
-# Force pkg-config to use the system FFmpeg (shared libraries) rather than any
-# custom FFmpeg build at /usr/local that may only have static libraries.
-# This avoids ABI mismatch: compiling against one version's headers but linking
-# against a different version's .so at runtime.
+# Use custom FFmpeg build at /usr/local with NVENC support (shared libraries).
+# This build includes h264_nvenc, hevc_nvenc, av1_nvenc encoders.
 find_package(PkgConfig REQUIRED)
 
-set(ENV{PKG_CONFIG_PATH} "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig")
+set(ENV{PKG_CONFIG_PATH} "/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig")
 
 pkg_check_modules(AVCODEC    REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(AVFORMAT   REQUIRED IMPORTED_TARGET libavformat)
@@ -46,12 +44,11 @@ pkg_check_modules(SWSCALE    REQUIRED IMPORTED_TARGET libswscale)
 pkg_check_modules(SWRESAMPLE REQUIRED IMPORTED_TARGET libswresample)
 
 # ─── Common FFmpeg link helper ───────────────────────────────────────────────
-# If a custom FFmpeg is installed at /usr/local, its headers in /usr/local/include
-# shadow the system ones (GCC searches /usr/local/include before /usr/include).
-# Use include_directories(BEFORE) to prepend system FFmpeg headers.
-# Force system FFmpeg headers before /usr/local/include
-# Using -I (not -isystem) ensures it comes before default system include paths
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/usr/include/x86_64-linux-gnu")
+# Use custom FFmpeg at /usr/local (built with NVENC support).
+# Set RPATH so the binary finds /usr/local/lib at runtime.
+set(CMAKE_INSTALL_RPATH "/usr/local/lib")
+set(CMAKE_BUILD_RPATH "/usr/local/lib")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 add_library(ffmpeg_deps INTERFACE)
 target_link_libraries(ffmpeg_deps INTERFACE
