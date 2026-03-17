@@ -785,7 +785,7 @@ __global__ void kernel_yiq_to_rgb(
     device_YIQ_to_RGB(r, g, b, fY[idx], fI[idx], fQ[idx]);
 
     uint32_t* dst_row = (uint32_t*)(dst_bgra + dst_stride * y);
-    dst_row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    dst_row[x] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
 // ─── Kernel: Initialize cuRAND states ───────────────────────────────────────
@@ -801,7 +801,7 @@ __global__ void kernel_init_rand(curandState* states, int count, unsigned long l
 // Host API
 // ═════════════════════════════════════════════════════════════════════════════
 
-bool ntsc_cuda_init(int width, int height) {
+bool ntsc_cuda_init(int width, int height, int priority) {
     gpu_max_scanlines = (height + 1) / 2;  // max scanlines per field
     gpu_frame_bgra_size = (size_t)width * height * 4;
     gpu_width = width;
@@ -815,14 +815,26 @@ bool ntsc_cuda_init(int width, int height) {
     // Query GPU stream priority range
     int priority_lo, priority_hi;  // lo = lowest priority (higher number), hi = highest priority (lower number)
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&priority_lo, &priority_hi));
-    
+
+    // Map priority level (0=low, 1=normal, 2=high) to CUDA stream priority
+    int stream_priority;
+    if (priority <= 0) {
+        stream_priority = priority_lo;  // lowest GPU priority
+    } else if (priority >= 2) {
+        stream_priority = priority_hi;  // highest GPU priority
+    } else {
+        stream_priority = (priority_lo + priority_hi) / 2;  // middle
+    }
+    fprintf(stderr, "CUDA stream priority: %d (range %d..%d, level=%d)\n",
+            stream_priority, priority_hi, priority_lo, priority);
+
     // Allocate double-buffered resources
     for (int i = 0; i < NTSC_CUDA_NUM_BUFFERS; i++) {
         BufferSet& buf = buffers[i];
         
-        // Create high-priority non-blocking stream for maximum GPU scheduling priority.
+        // Create stream with configured priority.
         // cudaStreamNonBlocking prevents implicit sync with the default stream.
-        CUDA_CHECK(cudaStreamCreateWithPriority(&buf.stream, cudaStreamNonBlocking, priority_hi));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&buf.stream, cudaStreamNonBlocking, stream_priority));
         
         // Device buffers
         CUDA_CHECK(cudaMalloc(&buf.d_fY, yiq_size));

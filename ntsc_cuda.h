@@ -67,8 +67,9 @@ struct NtscCudaParams {
 
 // Initialize CUDA resources (device buffers for YIQ, cuRAND states, etc.)
 // Call once at startup after output_width/output_height are known.
+// priority: 0=low, 1=normal, 2=high (default). Controls CUDA stream priority.
 // Returns true on success.
-bool ntsc_cuda_init(int width, int height);
+bool ntsc_cuda_init(int width, int height, int priority = 2);
 
 // Free all CUDA resources. Call once at shutdown.
 void ntsc_cuda_shutdown();

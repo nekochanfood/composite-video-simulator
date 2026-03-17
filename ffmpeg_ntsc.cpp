@@ -7,9 +7,11 @@
 // Platform headers (before FFmpeg to avoid type conflicts)
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #endif
 
+#include <algorithm>
 #include "common.h"
 #include "lowpass_filter.h"
 #include "color_convert.h"
@@ -38,6 +40,7 @@ static GpuPipelineState gpu_pipeline;
 #endif
 
 bool            use_422_colorspace = false; // I would default this to true but Adobe Premiere Pro apparently can't handle 4:2:2 H.264 >:(
+bool            stretch_mode = false;      // false = center-crop (default), true = stretch-to-fill
 AVRational	output_field_rate = { 60000, 1001 };	// NTSC 60Hz default
 int		output_width = 720;
 int		output_height = 480;
@@ -77,6 +80,10 @@ public:
         avpkt = NULL;
         eof_stream = false;
         eof = false;
+        crop_offset_x = 0;
+        crop_offset_y = 0;
+        crop_width = 0;
+        crop_height = 0;
     }
     ~InputFile() {
         close_input();
@@ -281,7 +288,7 @@ public:
 			}
 			else if (input_avstream_video != NULL && avpkt->stream_index == input_avstream_video->index) {
                 if (got_video) fprintf(stderr,"Video content lost\n");
-				AVRational m = (AVRational){output_field_rate.den, output_field_rate.num};
+				AVRational m = AVRational{output_field_rate.den, output_field_rate.num};
 				av_packet_rescale_ts(avpkt,input_avstream_video->time_base,m); // convert to FIELD number
                 handle_frame(avpkt); // will set got_video
                 break;
@@ -409,10 +416,51 @@ public:
         }
 
         if (input_avstream_video_resampler == NULL) {
+            // Calculate crop vs stretch parameters for this input resolution
+            int srcW = input_avstream_video_frame->width;
+            int srcH = input_avstream_video_frame->height;
+
+            if (stretch_mode) {
+                // Stretch: use full source frame
+                crop_offset_x = 0;
+                crop_offset_y = 0;
+                crop_width = srcW;
+                crop_height = srcH;
+            } else {
+                // Center-crop: crop source to match target aspect ratio, then scale
+                double srcAspect = (double)srcW / (double)srcH;
+                double dstAspect = (double)output_width / (double)output_height;
+
+                if (srcAspect > dstAspect) {
+                    // Source is wider than target — crop left/right
+                    crop_height = srcH;
+                    crop_width = (int)(dstAspect * srcH + 0.5);
+                    if (crop_width > srcW) crop_width = srcW;
+                    crop_width &= ~1;  // ensure even for chroma subsampling
+                    crop_offset_x = ((srcW - crop_width) / 2) & ~1;
+                    crop_offset_y = 0;
+                } else if (srcAspect < dstAspect) {
+                    // Source is taller than target — crop top/bottom
+                    crop_width = srcW;
+                    crop_height = (int)((double)srcW / dstAspect + 0.5);
+                    if (crop_height > srcH) crop_height = srcH;
+                    crop_height &= ~1;
+                    crop_offset_x = 0;
+                    crop_offset_y = ((srcH - crop_height) / 2) & ~1;
+                } else {
+                    // Same aspect ratio — no crop needed
+                    crop_offset_x = 0;
+                    crop_offset_y = 0;
+                    crop_width = srcW;
+                    crop_height = srcH;
+                }
+            }
+
+            // Create scaler from cropped source dimensions to output
             input_avstream_video_resampler = sws_getContext(
-                    // source
-                    input_avstream_video_frame->width,
-                    input_avstream_video_frame->height,
+                    // source (cropped region)
+                    crop_width,
+                    crop_height,
                     (AVPixelFormat)input_avstream_video_frame->format,
                     // dest
                     input_avstream_video_frame_rgb->width,
@@ -422,7 +470,9 @@ public:
                     SWS_BILINEAR, NULL, NULL, NULL);
 
             if (input_avstream_video_resampler != NULL) {
-                fprintf(stderr,"sws_getContext new context\n");
+                fprintf(stderr,"sws_getContext new context: %dx%d -> crop %dx%d (offset %d,%d) -> %dx%d (%s)\n",
+                        srcW, srcH, crop_width, crop_height, crop_offset_x, crop_offset_y,
+                        output_width, output_height, stretch_mode ? "stretch" : "center-crop");
                 input_avstream_video_resampler_format = (AVPixelFormat)input_avstream_video_frame->format;
                 input_avstream_video_resampler_width = input_avstream_video_frame->width;
                 input_avstream_video_resampler_height = input_avstream_video_frame->height;
@@ -437,11 +487,64 @@ public:
             input_avstream_video_frame_rgb->flags = (input_avstream_video_frame_rgb->flags & ~(AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED)) |
                 (input_avstream_video_frame->flags & (AV_FRAME_FLAG_TOP_FIELD_FIRST | AV_FRAME_FLAG_INTERLACED));
 
+            // Build source pointers offset to the crop region.
+            // For planar formats, each plane needs its own offset based on chroma subsampling.
+            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)input_avstream_video_frame->format);
+            uint8_t *srcData[4] = {};
+            int srcLinesize[4] = {};
+
+            if (desc != NULL && crop_offset_x == 0 && crop_offset_y == 0) {
+                // No crop offset — use original pointers directly
+                for (int p = 0; p < 4; p++) {
+                    srcData[p] = input_avstream_video_frame->data[p];
+                    srcLinesize[p] = input_avstream_video_frame->linesize[p];
+                }
+            }
+            else if (desc != NULL) {
+                int numPlanes = av_pix_fmt_count_planes((AVPixelFormat)input_avstream_video_frame->format);
+                // Chroma subsampling shifts (0 means no subsampling on that axis)
+                int chromaShiftX = desc->log2_chroma_w;  // e.g. 1 for YUV420P (half width)
+                int chromaShiftY = desc->log2_chroma_h;  // e.g. 1 for YUV420P (half height)
+
+                for (int p = 0; p < 4; p++) {
+                    if (input_avstream_video_frame->data[p] == NULL) {
+                        srcData[p] = NULL;
+                        srcLinesize[p] = input_avstream_video_frame->linesize[p];
+                        continue;
+                    }
+
+                    srcLinesize[p] = input_avstream_video_frame->linesize[p];
+
+                    if (p == 0 || p == 3) {
+                        // Luma plane (0) or alpha plane (3): full resolution offsets
+                        int bytesPerSample = (desc->comp[0].depth > 8) ? 2 : 1;
+                        // For packed formats (BGRA, RGB24, etc.), step gives bytes per pixel
+                        int step = (desc->nb_components > 1 && numPlanes == 1) ? desc->comp[0].step : bytesPerSample;
+                        srcData[p] = input_avstream_video_frame->data[p]
+                            + crop_offset_y * srcLinesize[p]
+                            + crop_offset_x * step;
+                    } else {
+                        // Chroma planes (1, 2): apply chroma subsampling to offsets
+                        int bytesPerSample = (desc->comp[p].depth > 8) ? 2 : 1;
+                        srcData[p] = input_avstream_video_frame->data[p]
+                            + (crop_offset_y >> chromaShiftY) * srcLinesize[p]
+                            + (crop_offset_x >> chromaShiftX) * bytesPerSample;
+                    }
+                }
+            }
+            else {
+                // Fallback: no descriptor available, use original pointers
+                for (int p = 0; p < 4; p++) {
+                    srcData[p] = input_avstream_video_frame->data[p];
+                    srcLinesize[p] = input_avstream_video_frame->linesize[p];
+                }
+            }
+
             if (sws_scale(input_avstream_video_resampler,
-                        // source
-                        input_avstream_video_frame->data,
-                        input_avstream_video_frame->linesize,
-                        0,input_avstream_video_frame->height,
+                        // source (with crop offset applied)
+                        (const uint8_t *const *)srcData,
+                        srcLinesize,
+                        0, crop_height,
                         // dest
                         input_avstream_video_frame_rgb->data,
                         input_avstream_video_frame_rgb->linesize) <= 0)
@@ -538,6 +641,10 @@ public:
     AVPixelFormat           input_avstream_video_resampler_format;
     int                     input_avstream_video_resampler_height;
     int                     input_avstream_video_resampler_width;
+    int                     crop_offset_x;      // center-crop: pixel offset into source frame
+    int                     crop_offset_y;
+    int                     crop_width;          // center-crop: cropped region dimensions
+    int                     crop_height;
     signed long long        next_pts;
     signed long long        next_dts;
     AVPacket*               avpkt;
@@ -707,6 +814,7 @@ static void help(const char *arg0) {
     fprintf(stderr," -out-composite-lowpass-lite <n> Enable/disable chroma lowpass on composite out (lite)\n");
     fprintf(stderr," -bkey-feedback <n>        Black key feedback (black level <= N)\n");
     fprintf(stderr," -comp-phase <n>           NTSC subcarrier phase per scanline (0, 90, 180, or 270)\n");
+    fprintf(stderr," -stretch                  Stretch input to fill output (default: center-crop)\n");
 	fprintf(stderr,"\n");
 	fprintf(stderr," Output file will be up/down converted to 720x480 (NTSC 29.97fps) or 720x576 (PAL 25fps).\n");
 	fprintf(stderr," Output will be rendered as interlaced video.\n");
@@ -877,6 +985,9 @@ static int parse_argv(int argc,char **argv) {
             else if (!strcmp(a,"nocomp")) {
                 enable_composite_emulation = false;
                 enable_audio_emulation = false;
+            }
+            else if (!strcmp(a,"stretch")) {
+                stretch_mode = true;
             }
 			else if (!strcmp(a,"vhs-head-switching-point")) {
 				vhs_head_switching_point = atof(argv[i++]);
@@ -1268,7 +1379,7 @@ void chroma_into_luma(AVFrame *dstframe,int *fY,int *fI,int *fQ,unsigned int fie
 
 void chroma_from_luma(AVFrame *dstframe,int *fY,int *fI,int *fQ,unsigned int field,unsigned long long fieldno,int subcarrier_amplitude) {
     /* decode color from luma */
-    int chroma[dstframe->width]; // WARNING: This is more GCC-specific C++ than normal
+    std::vector<int> chroma(dstframe->width); // MSVC-compatible replacement for VLA
     unsigned int x,y;
 
     for (y=field;y < dstframe->height;y += 2) {
@@ -1458,14 +1569,13 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
 			    int *Y = fY + (y * dstframe->width);
 
 				if (shif != 0) {
-					int tmp[twidth];
+					std::vector<int> tmp(twidth, 0);
 
 					/* WARNING: This is not 100% accurate. On real VHS you'd see the line shifted over and the next line's contents after hsync. */
 
 					/* luma. the chroma subcarrier is there, so this is all we have to do. */
 					x2 = (tx + twidth + (unsigned int)shif) % (unsigned int)twidth;
-					memset(tmp,0,sizeof(tmp));
-					memcpy(tmp,Y,dstframe->width*sizeof(int));
+					memcpy(tmp.data(),Y,dstframe->width*sizeof(int));
 					for (x=tx;x < dstframe->width;x++) {
 						Y[x] = tmp[x2];
 						if ((++x2) == twidth) x2 = 0;
@@ -1613,11 +1723,11 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
 		// phase line up per scanline (else summing the previous line's carrier would
 		// cancel it out).
 		if (vhs_chroma_vert_blend && output_ntsc) {
-			int delayU[dstframe->width];
-			int delayV[dstframe->width];
+			std::vector<int> delayU(dstframe->width);
+			std::vector<int> delayV(dstframe->width);
 
-			memset(delayU,0,dstframe->width*sizeof(int));
-			memset(delayV,0,dstframe->width*sizeof(int));
+			memset(delayU.data(),0,dstframe->width*sizeof(int));
+			memset(delayV.data(),0,dstframe->width*sizeof(int));
 			for (y=(field+2);y < dstframe->height;y += 2) {
 				int *U = fI + (y * dstframe->width);
 				int *V = fQ + (y * dstframe->width);
@@ -1787,7 +1897,7 @@ int main(int argc,char **argv) {
 
 		output_avstream_audio_codec_context->sample_rate = output_audio_rate;
 		output_avstream_audio_codec_context->sample_fmt = AV_SAMPLE_FMT_S16;
-		output_avstream_audio_codec_context->time_base = (AVRational){1, output_audio_rate};
+		output_avstream_audio_codec_context->time_base = AVRational{1, output_audio_rate};
 		output_avstream_audio->time_base = output_avstream_audio_codec_context->time_base;
 
 		if (output_avfmt->oformat->flags & AVFMT_GLOBALHEADER)
@@ -1819,11 +1929,11 @@ int main(int argc,char **argv) {
 
 		output_avstream_video_codec_context->width = output_width;
 		output_avstream_video_codec_context->height = output_height;
-		output_avstream_video_codec_context->sample_aspect_ratio = (AVRational){output_height*4, output_width*3};
+		output_avstream_video_codec_context->sample_aspect_ratio = AVRational{output_height*4, output_width*3};
 		output_avstream_video_codec_context->pix_fmt = use_422_colorspace ? AV_PIX_FMT_YUV422P : AV_PIX_FMT_YUV420P;
 		output_avstream_video_codec_context->gop_size = 15;
 		output_avstream_video_codec_context->max_b_frames = 0;
-		output_avstream_video_codec_context->time_base = (AVRational){output_field_rate.den, output_field_rate.num};
+		output_avstream_video_codec_context->time_base = AVRational{output_field_rate.den, output_field_rate.num};
 
 		output_avstream_video->time_base = output_avstream_video_codec_context->time_base;
 		if (output_avfmt->oformat->flags & AVFMT_GLOBALHEADER)

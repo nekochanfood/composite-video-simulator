@@ -90,9 +90,11 @@ static void flush_encoder_and_close(void) {
 // Install signal handlers for graceful shutdown
 static void install_signal_handlers(void) {
 	signal(SIGINT, sigma);
+	signal(SIGTERM, sigma);
+#ifndef _WIN32
 	signal(SIGHUP, sigma);
 	signal(SIGQUIT, sigma);
-	signal(SIGTERM, sigma);
+#endif
 }
 
 #endif // OUTPUT_CONTEXT_H

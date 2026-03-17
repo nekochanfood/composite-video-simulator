@@ -280,11 +280,11 @@ int main(int argc,char **argv) {
 
 		output_avstream_video_codec_context->width = output_width;
 		output_avstream_video_codec_context->height = output_height;
-		output_avstream_video_codec_context->sample_aspect_ratio = (AVRational){output_ar_n,output_ar_d};
+		output_avstream_video_codec_context->sample_aspect_ratio = AVRational{output_ar_n,output_ar_d};
 		output_avstream_video_codec_context->pix_fmt = use_422_colorspace ? AV_PIX_FMT_YUV422P : AV_PIX_FMT_YUV420P;
 		output_avstream_video_codec_context->gop_size = 15;
 		output_avstream_video_codec_context->max_b_frames = 0;
-		output_avstream_video_codec_context->time_base = (AVRational){output_field_rate.den, output_field_rate.num};
+		output_avstream_video_codec_context->time_base = AVRational{output_field_rate.den, output_field_rate.num};
 
 		av_dict_set(&opt_dict,"crf","16",0);
 		av_dict_set(&opt_dict,"crf_max","16",0);

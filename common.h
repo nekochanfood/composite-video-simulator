@@ -10,7 +10,9 @@
 #include <signal.h>
 #include <stdint.h>
 #include <assert.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>

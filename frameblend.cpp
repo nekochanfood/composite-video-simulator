@@ -333,12 +333,12 @@ int main(int argc,char **argv) {
 
 		output_avstream_video_codec_context->width = output_width;
 		output_avstream_video_codec_context->height = output_height;
-		output_avstream_video_codec_context->sample_aspect_ratio = (AVRational){output_ar_n,output_ar_d};
+		output_avstream_video_codec_context->sample_aspect_ratio = AVRational{output_ar_n,output_ar_d};
 		output_avstream_video_codec_context->pix_fmt = use_422_colorspace ? AV_PIX_FMT_YUV422P : AV_PIX_FMT_YUV420P;
 		output_avstream_video_codec_context->gop_size = 15;
 		output_avstream_video_codec_context->max_b_frames = 0;
 		output_avstream_video_codec_context->bit_rate = 25000000;
-		output_avstream_video_codec_context->time_base = (AVRational){output_field_rate.den, output_field_rate.num};
+		output_avstream_video_codec_context->time_base = AVRational{output_field_rate.den, output_field_rate.num};
 
 		output_avstream_video->time_base = output_avstream_video_codec_context->time_base;
 		if (output_avfmt->oformat->flags & AVFMT_GLOBALHEADER)
