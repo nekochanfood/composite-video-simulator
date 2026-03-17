@@ -44,6 +44,7 @@ extern "C" {
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <utility>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -623,11 +624,10 @@ static void chroma_from_luma(AVFrame *dstframe, int *fY, int *fI, int *fQ, unsig
     }
 }
 
-// Main composite processing function — applies NTSC signal simulation to one field
+// Main composite processing function — applies NTSC signal simulation to one frame
 static void composite_layer(AVFrame *dstframe, AVFrame *srcframe, unsigned long long fieldno) {
     uint32_t *dscan, *sscan;
     unsigned int x, y;
-    int *fY, *fI, *fQ;
     int r, g, b;
 
     if (dstframe == NULL || srcframe == NULL) return;
@@ -637,13 +637,21 @@ static void composite_layer(AVFrame *dstframe, AVFrame *srcframe, unsigned long 
     if (dstframe->width != srcframe->width) return;
     if (dstframe->height != srcframe->height) return;
 
-    fY = new int[dstframe->width * dstframe->height];
-    fI = new int[dstframe->width * dstframe->height];
-    fQ = new int[dstframe->width * dstframe->height];
+    // Pre-allocated YIQ buffers — avoid per-frame heap allocation
+    static int *fY = nullptr, *fI = nullptr, *fQ = nullptr;
+    static int yiq_buf_size = 0;
+    int needed = dstframe->width * dstframe->height;
+    if (needed > yiq_buf_size) {
+        delete[] fY; delete[] fI; delete[] fQ;
+        fY = new int[needed];
+        fI = new int[needed];
+        fQ = new int[needed];
+        yiq_buf_size = needed;
+    }
 
-    memset(fY, 0, dstframe->width * dstframe->height * sizeof(int));
-    memset(fI, 0, dstframe->width * dstframe->height * sizeof(int));
-    memset(fQ, 0, dstframe->width * dstframe->height * sizeof(int));
+    memset(fY, 0, needed * sizeof(int));
+    memset(fI, 0, needed * sizeof(int));
+    memset(fQ, 0, needed * sizeof(int));
 
     for (y=0; y < (unsigned int)dstframe->height; y++) {
         sscan = (uint32_t*)(srcframe->data[0] + (srcframe->linesize[0] * y));
@@ -689,68 +697,6 @@ static void composite_layer(AVFrame *dstframe, AVFrame *srcframe, unsigned long 
         }
     }
 
-    // VHS head switching noise
-    if (vhs_head_switching) {
-        unsigned int twidth = dstframe->width + (dstframe->width / 10);
-        unsigned int tx, p, x2, shy=0;
-        double noise_val = 0;
-        int shif, ishif;
-        int iy;
-        double t;
-
-        if (vhs_head_switching_phase_noise != 0) {
-            unsigned int rx = (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand();
-            rx %= 2000000000U;
-            noise_val = ((double)rx / 1000000000U) - 1.0;
-            noise_val *= vhs_head_switching_phase_noise;
-        }
-
-        if (output_ntsc)
-            t = twidth * 262.5;
-        else
-            t = twidth * 312.5;
-
-        p = (unsigned int)(fmod(vhs_head_switching_point + noise_val, 1.0) * t);
-        iy = (p / (unsigned int)twidth);
-
-        p = (unsigned int)(fmod(vhs_head_switching_phase + noise_val, 1.0) * t);
-        x = p % (unsigned int)twidth;
-
-        if (output_ntsc)
-            iy -= (262 - 240);
-        else
-            iy -= (312 - 288);
-
-        tx = x;
-        if (x >= (twidth/2))
-            ishif = x - twidth;
-        else
-            ishif = x;
-
-        shif = 0;
-        while (iy < dstframe->height) {
-            if (iy >= 0) {
-                int *Y = fY + (iy * dstframe->width);
-                if (shif != 0) {
-                    std::vector<int> tmp(twidth, 0);
-                    memcpy(tmp.data(), Y, dstframe->width * sizeof(int));
-                    x2 = (tx + twidth + (unsigned int)shif) % (unsigned int)twidth;
-                    for (x=tx; x < (unsigned int)dstframe->width; x++) {
-                        Y[x] = tmp[x2];
-                        if ((++x2) == twidth) x2 = 0;
-                    }
-                }
-            }
-            if (shy == 0)
-                shif = ishif;
-            else
-                shif = (shif * 7) / 8;
-            tx = 0;
-            iy += 1;
-            shy++;
-        }
-    }
-
     if (!nocolor_subcarrier)
         chroma_from_luma(dstframe, fY, fI, fQ, fieldno, subcarrier_amplitude_back);
 
@@ -789,6 +735,78 @@ static void composite_layer(AVFrame *dstframe, AVFrame *srcframe, unsigned long 
                 U[x] = (int)u_;
                 V[x] = (int)v_;
             }
+        }
+    }
+
+    // VHS head switching noise (moved after chroma_from_luma so I/Q zeroing is not
+    // overwritten by subcarrier decode; runs before VHS emulation so re-encode sees
+    // zero chroma in the affected region)
+    if (vhs_head_switching) {
+        unsigned int twidth = dstframe->width + (dstframe->width / 10);
+        unsigned int tx, p, x2, shy=0;
+        double noise_val = 0;
+        int shif, ishif;
+        int iy;
+        double t;
+
+        if (vhs_head_switching_phase_noise != 0) {
+            unsigned int rx = (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand();
+            rx %= 2000000000U;
+            noise_val = ((double)rx / 1000000000U) - 1.0;
+            noise_val *= vhs_head_switching_phase_noise;
+        }
+
+        if (output_ntsc)
+            t = twidth * 262.5;
+        else
+            t = twidth * 312.5;
+
+        p = (unsigned int)(fmod(vhs_head_switching_point + noise_val, 1.0) * t);
+        iy = (p / (unsigned int)twidth) * 2;
+
+        p = (unsigned int)(fmod(vhs_head_switching_phase + noise_val, 1.0) * t);
+        x = p % (unsigned int)twidth;
+
+        if (output_ntsc)
+            iy -= (262 - 240) * 2;
+        else
+            iy -= (312 - 288) * 2;
+
+        tx = x;
+        if (x >= (twidth/2))
+            ishif = x - twidth;
+        else
+            ishif = x;
+
+        shif = 0;
+        while (iy < dstframe->height) {
+            if (iy >= 0) {
+                int *Y = fY + (iy * dstframe->width);
+
+                // Zero I/Q (chroma) for all head-switching-affected scanlines.
+                // Real VHS loses color lock in this region, producing monochrome output.
+                int *I = fI + (iy * dstframe->width);
+                int *Q = fQ + (iy * dstframe->width);
+                memset(I, 0, dstframe->width * sizeof(int));
+                memset(Q, 0, dstframe->width * sizeof(int));
+
+                if (shif != 0) {
+                    std::vector<int> tmp(twidth, 0);
+                    memcpy(tmp.data(), Y, dstframe->width * sizeof(int));
+                    x2 = (tx + twidth + (unsigned int)shif) % (unsigned int)twidth;
+                    for (x=tx; x < (unsigned int)dstframe->width; x++) {
+                        Y[x] = tmp[x2];
+                        if ((++x2) == twidth) x2 = 0;
+                    }
+                }
+            }
+            if (shy == 0)
+                shif = ishif;
+            else
+                shif = (shif * 7) / 8;
+            tx = 0;
+            iy += 1;
+            shy++;
         }
     }
 
@@ -911,9 +929,7 @@ static void composite_layer(AVFrame *dstframe, AVFrame *srcframe, unsigned long 
         }
     }
 
-    delete[] fY;
-    delete[] fI;
-    delete[] fQ;
+    // YIQ buffers are static — no per-frame deallocation needed
 }
 
 // ─── GUI frame update helper ────────────────────────────────────────────────
@@ -1276,55 +1292,52 @@ static void processing_thread_func() {
         } // end receive block
 
         // ── Process full frame (progressive) ──
-        // CPU path: composite_layer processes all scanlines in one call (no field splitting).
-        // CUDA path: kernels still use field-based line stepping, so we call twice (field=0, field=1).
+        // Both CPU and CUDA paths now process all scanlines in one call.
 
         if (enable_composite_emulation) {
             AVFrame *comp_src = have_prev_frame ? prevFrame : srcFrame;
 
 #ifdef HAVE_CUDA
             if (cuda_available) {
-                // CUDA kernels use field-based y = field + idx*2, so call twice for full frame
-                for (int pass = 0; pass < 2; pass++) {
-                    NtscCudaParams cp = {};
-                    cp.width = output_width;
-                    cp.height = output_height;
-                    cp.subcarrier_amplitude = subcarrier_amplitude;
-                    cp.subcarrier_amplitude_back = subcarrier_amplitude_back;
-                    cp.video_scanline_phase_shift = video_scanline_phase_shift;
-                    cp.video_scanline_phase_shift_offset = video_scanline_phase_shift_offset;
-                    cp.video_noise = video_noise;
-                    cp.video_chroma_noise = video_chroma_noise;
-                    cp.video_chroma_phase_noise = video_chroma_phase_noise;
-                    cp.video_chroma_loss = video_chroma_loss;
-                    cp.composite_preemphasis = composite_preemphasis;
-                    cp.composite_preemphasis_cut = composite_preemphasis_cut;
-                    cp.composite_in_chroma_lowpass = composite_in_chroma_lowpass;
-                    cp.composite_out_chroma_lowpass = composite_out_chroma_lowpass;
-                    cp.composite_out_chroma_lowpass_lite = composite_out_chroma_lowpass_lite;
-                    cp.nocolor_subcarrier = nocolor_subcarrier;
-                    cp.nocolor_subcarrier_after_yc_sep = nocolor_subcarrier_after_yc_sep;
-                    cp.enable_composite_emulation = enable_composite_emulation;
-                    cp.emulating_vhs = emulating_vhs;
-                    cp.output_vhs_tape_speed = output_vhs_tape_speed;
-                    cp.vhs_chroma_vert_blend = vhs_chroma_vert_blend;
-                    cp.vhs_svideo_out = vhs_svideo_out;
-                    cp.vhs_out_sharpen = vhs_out_sharpen;
-                    cp.output_ntsc = output_ntsc;
-                    cp.vhs_head_switching = vhs_head_switching;
-                    cp.vhs_head_switching_point = vhs_head_switching_point;
-                    cp.vhs_head_switching_phase = vhs_head_switching_phase;
-                    cp.vhs_head_switching_phase_noise = vhs_head_switching_phase_noise;
-                    cp.opposite = 0;
+                NtscCudaParams cp = {};
+                cp.width = output_width;
+                cp.height = output_height;
+                cp.subcarrier_amplitude = subcarrier_amplitude;
+                cp.subcarrier_amplitude_back = subcarrier_amplitude_back;
+                cp.video_scanline_phase_shift = video_scanline_phase_shift;
+                cp.video_scanline_phase_shift_offset = video_scanline_phase_shift_offset;
+                cp.video_noise = video_noise;
+                cp.video_chroma_noise = video_chroma_noise;
+                cp.video_chroma_phase_noise = video_chroma_phase_noise;
+                cp.video_chroma_loss = video_chroma_loss;
+                cp.composite_preemphasis = composite_preemphasis;
+                cp.composite_preemphasis_cut = composite_preemphasis_cut;
+                cp.composite_in_chroma_lowpass = composite_in_chroma_lowpass;
+                cp.composite_out_chroma_lowpass = composite_out_chroma_lowpass;
+                cp.composite_out_chroma_lowpass_lite = composite_out_chroma_lowpass_lite;
+                cp.nocolor_subcarrier = nocolor_subcarrier;
+                cp.nocolor_subcarrier_after_yc_sep = nocolor_subcarrier_after_yc_sep;
+                cp.enable_composite_emulation = enable_composite_emulation;
+                cp.emulating_vhs = emulating_vhs;
+                cp.output_vhs_tape_speed = output_vhs_tape_speed;
+                cp.vhs_chroma_vert_blend = vhs_chroma_vert_blend;
+                cp.vhs_svideo_out = vhs_svideo_out;
+                cp.vhs_out_sharpen = vhs_out_sharpen;
+                cp.output_ntsc = output_ntsc;
+                cp.vhs_head_switching = vhs_head_switching;
+                cp.vhs_head_switching_point = vhs_head_switching_point;
+                cp.vhs_head_switching_phase = vhs_head_switching_phase;
+                cp.vhs_head_switching_phase_noise = vhs_head_switching_phase_noise;
+                cp.opposite = 0;
+                cp.field = 0;
+                cp.fieldno = fieldno;
+                cp.progressive = true;  // spout_ntsc uses progressive (all scanlines per frame)
 
-                    cp.field = pass;
-                    cp.fieldno = fieldno;
-                    ntsc_cuda_composite_layer(
-                        comp_src->data[0], comp_src->linesize[0],
-                        dstFrame->data[0], dstFrame->linesize[0],
-                        cp);
-                    ntsc_cuda_sync();
-                }
+                ntsc_cuda_composite_layer(
+                    comp_src->data[0], comp_src->linesize[0],
+                    dstFrame->data[0], dstFrame->linesize[0],
+                    cp);
+                ntsc_cuda_sync();
             }
             else
 #endif
@@ -1373,13 +1386,19 @@ static void processing_thread_func() {
             }
         }
 
-        // ── Copy to send buffer and send ──
-        for (int y = 0; y < output_height; y++) {
-            memcpy(sendBuf + y * output_width * 4,
-                   dstFrame->data[0] + dstFrame->linesize[0] * y,
-                   output_width * 4);
+        // ── Send frame via Spout ──
+        if (dstFrame->linesize[0] == output_width * 4) {
+            // Stride matches — send directly from dstFrame, no copy needed
+            spoutOut.SendImage(dstFrame->data[0], output_width, output_height);
+        } else {
+            // Stride mismatch — must copy to contiguous buffer
+            for (int y = 0; y < output_height; y++) {
+                memcpy(sendBuf + y * output_width * 4,
+                       dstFrame->data[0] + dstFrame->linesize[0] * y,
+                       output_width * 4);
+            }
+            spoutOut.SendImage(sendBuf, output_width, output_height);
         }
-        spoutOut.SendImage(sendBuf, output_width, output_height);
 
         // Debug: track actual send intervals
         {
@@ -1420,12 +1439,10 @@ static void processing_thread_func() {
         }
 
         // ── Advance frame state ──
-        // Save current frame as previous for next iteration's composite_layer
-        for (int y = 0; y < output_height; y++) {
-            memcpy(prevFrame->data[0] + prevFrame->linesize[0] * y,
-                   srcFrame->data[0] + srcFrame->linesize[0] * y,
-                   output_width * 4);
-        }
+        // Swap srcFrame and prevFrame pointers — avoids per-frame memcpy.
+        // After swap: prevFrame points to this iteration's source data,
+        // srcFrame points to the (now stale) buffer that will be overwritten next iteration.
+        std::swap(srcFrame, prevFrame);
         have_prev_frame = true;
         fieldno++;  // one frame = one fieldno increment
     }

@@ -63,6 +63,11 @@ struct NtscCudaParams {
 
     // interlaced source info
     unsigned char opposite;        // field offset for interlaced source
+
+    // progressive mode: when true, kernels process all scanlines (y = scanline_idx).
+    // when false, kernels process interlaced field lines (y = field + scanline_idx * 2).
+    // spout_ntsc uses progressive=true; ffmpeg_ntsc uses progressive=false.
+    bool progressive;
 };
 
 // Initialize CUDA resources (device buffers for YIQ, cuRAND states, etc.)

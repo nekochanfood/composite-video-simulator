@@ -1526,74 +1526,6 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
 		}
 	}
 
-	// VHS head switching noise
-	if (vhs_head_switching) {
-		unsigned int twidth = dstframe->width + (dstframe->width / 10);
-		unsigned int tx,x,p,x2,shy=0;
-		double noise = 0;
-		int shif,ishif,y;
-		double t;
-
-		if (vhs_head_switching_phase_noise != 0) {
-			unsigned int x = (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand();
-			x %= 2000000000U;
-			noise = ((double)x / 1000000000U) - 1.0;
-			noise *= vhs_head_switching_phase_noise;
-		}
-
-		if (output_ntsc)
-			t = twidth * 262.5;
-		else
-			t = twidth * 312.5;
-
-		p = (unsigned int)(fmod(vhs_head_switching_point + noise,1.0) * t);
-		y = ((p / (unsigned int)twidth) * 2) + field;
-
-		p = (unsigned int)(fmod(vhs_head_switching_phase + noise,1.0) * t);
-		x = p % (unsigned int)twidth;
-
-		if (output_ntsc)
-			y -= (262 - 240) * 2;
-		else
-			y -= (312 - 288) * 2;
-
-		tx = x;
-		if (x >= (twidth/2))
-			ishif = x - twidth;
-		else
-			ishif = x;
-
-		shif = 0;
-		while (y < dstframe->height) {
-			if (y >= 0) {
-			    int *Y = fY + (y * dstframe->width);
-
-				if (shif != 0) {
-					std::vector<int> tmp(twidth, 0);
-
-					/* WARNING: This is not 100% accurate. On real VHS you'd see the line shifted over and the next line's contents after hsync. */
-
-					/* luma. the chroma subcarrier is there, so this is all we have to do. */
-					x2 = (tx + twidth + (unsigned int)shif) % (unsigned int)twidth;
-					memcpy(tmp.data(),Y,dstframe->width*sizeof(int));
-					for (x=tx;x < dstframe->width;x++) {
-						Y[x] = tmp[x2];
-						if ((++x2) == twidth) x2 = 0;
-					}
-				}
-			}
-
-			if (shy == 0)
-				shif = ishif;
-			else
-				shif = (shif * 7) / 8;
-
-			tx = 0;
-			y += 2;
-			shy++;
-		}
-	}
-
     if (!nocolor_subcarrier)
         chroma_from_luma(dstframe,fY,fI,fQ,field,fieldno,subcarrier_amplitude_back);
 
@@ -1647,6 +1579,83 @@ void composite_layer(AVFrame *dstframe,AVFrame *srcframe,InputFile &inputfile,un
 
 	// NTS: At this point, the video best resembles what you'd get from a typical DVD player's composite video output.
 	//      Slightly blurry, some color artifacts, and edges will have that "buzz" effect, but still a good picture.
+
+	// VHS head switching noise (moved after chroma_from_luma so I/Q zeroing is not
+	// overwritten by subcarrier decode; runs before VHS emulation so re-encode sees
+	// zero chroma in the affected region)
+	if (vhs_head_switching) {
+		unsigned int twidth = dstframe->width + (dstframe->width / 10);
+		unsigned int tx,x,p,x2,shy=0;
+		double noise = 0;
+		int shif,ishif,y;
+		double t;
+
+		if (vhs_head_switching_phase_noise != 0) {
+			unsigned int x = (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand() * (unsigned int)rand();
+			x %= 2000000000U;
+			noise = ((double)x / 1000000000U) - 1.0;
+			noise *= vhs_head_switching_phase_noise;
+		}
+
+		if (output_ntsc)
+			t = twidth * 262.5;
+		else
+			t = twidth * 312.5;
+
+		p = (unsigned int)(fmod(vhs_head_switching_point + noise,1.0) * t);
+		y = ((p / (unsigned int)twidth) * 2) + field;
+
+		p = (unsigned int)(fmod(vhs_head_switching_phase + noise,1.0) * t);
+		x = p % (unsigned int)twidth;
+
+		if (output_ntsc)
+			y -= (262 - 240) * 2;
+		else
+			y -= (312 - 288) * 2;
+
+		tx = x;
+		if (x >= (twidth/2))
+			ishif = x - twidth;
+		else
+			ishif = x;
+
+		shif = 0;
+		while (y < dstframe->height) {
+			if (y >= 0) {
+			    int *Y = fY + (y * dstframe->width);
+
+				// Zero I/Q (chroma) for all head-switching-affected scanlines.
+				// Real VHS loses color lock in this region, producing monochrome output.
+				int *I = fI + (y * dstframe->width);
+				int *Q = fQ + (y * dstframe->width);
+				memset(I, 0, dstframe->width * sizeof(int));
+				memset(Q, 0, dstframe->width * sizeof(int));
+
+				if (shif != 0) {
+					std::vector<int> tmp(twidth, 0);
+
+					/* WARNING: This is not 100% accurate. On real VHS you'd see the line shifted over and the next line's contents after hsync. */
+
+					/* luma. the chroma subcarrier is there, so this is all we have to do. */
+					x2 = (tx + twidth + (unsigned int)shif) % (unsigned int)twidth;
+					memcpy(tmp.data(),Y,dstframe->width*sizeof(int));
+					for (x=tx;x < dstframe->width;x++) {
+						Y[x] = tmp[x2];
+						if ((++x2) == twidth) x2 = 0;
+					}
+				}
+			}
+
+			if (shy == 0)
+				shif = ishif;
+			else
+				shif = (shif * 7) / 8;
+
+			tx = 0;
+			y += 2;
+			shy++;
+		}
+	}
 
 	if (emulating_vhs) {
 		double luma_cut,chroma_cut;
@@ -2216,6 +2225,7 @@ int main(int argc,char **argv) {
                             cp.height = dstframe->height;
                             cp.field = field;
                             cp.fieldno = current;
+                            cp.progressive = false;  // ffmpeg_ntsc uses interlaced field-based processing
                             cp.subcarrier_amplitude = subcarrier_amplitude;
                             cp.subcarrier_amplitude_back = subcarrier_amplitude_back;
                             cp.video_scanline_phase_shift = video_scanline_phase_shift;

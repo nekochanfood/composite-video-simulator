@@ -160,11 +160,12 @@ __device__ unsigned int device_subcarrier_xi(
 __global__ void kernel_rgb_to_yiq(
     const uint8_t* __restrict__ src_bgra, int src_stride,
     int* __restrict__ fY, int* __restrict__ fI, int* __restrict__ fQ,
-    int width, int height, unsigned int field, unsigned char opposite)
+    int width, int height, unsigned int field, unsigned char opposite,
+    bool progressive)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int scanline_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
 
     if (x >= width || y >= height) return;
 
@@ -205,10 +206,11 @@ __global__ void kernel_scanline_pre_composite(
     // flags
     bool do_chroma_lowpass, bool do_preemphasis, bool do_noise,
     // cuRAND states
-    curandState* __restrict__ rand_states)
+    curandState* __restrict__ rand_states,
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     int* Y = fY + (y * width);
@@ -283,13 +285,16 @@ __global__ void kernel_scanline_pre_composite(
 
 __global__ void kernel_vhs_head_switching(
     int* __restrict__ fY,
+    int* __restrict__ fI,
+    int* __restrict__ fQ,
     int width, int height, unsigned int field,
     bool output_ntsc,
     float vhs_head_switching_point,
     float vhs_head_switching_phase,
     float vhs_head_switching_phase_noise,
     curandState* __restrict__ rand_states,
-    int* __restrict__ scratch_tmp)   // scratch_tmp: width*2 ints for temp copy
+    int* __restrict__ scratch_tmp,   // scratch_tmp: width*2 ints for temp copy
+    bool progressive)
 {
     // Phase 1: Thread 0 computes shift values for each affected scanline.
     // Phase 2: All threads cooperate to apply pixel shifts in parallel.
@@ -302,6 +307,7 @@ __global__ void kernel_vhs_head_switching(
     __shared__ int s_num_lines;
     __shared__ unsigned int s_twidth;
     __shared__ unsigned int s_tx_start;
+    __shared__ int s_y_step;
 
     if (threadIdx.x == 0) {
         unsigned int twidth = width + (width / 10);
@@ -328,18 +334,34 @@ __global__ void kernel_vhs_head_switching(
             t = twidth * 312.5f;
 
         unsigned int p_point = (unsigned int)(fmodf(vhs_head_switching_point + noise, 1.0f) * t);
-        int y_start = ((p_point / twidth) * 2) + field;
+        int y_start;
+        int y_step;
+        int y_offset;
+        if (progressive) {
+            // Progressive: map field-line to frame-line with *2
+            y_start = (int)(p_point / twidth) * 2;
+            y_step = 1;
+            if (output_ntsc)
+                y_offset = (262 - 240) * 2;
+            else
+                y_offset = (312 - 288) * 2;
+        } else {
+            // Interlaced: original field-based calculation
+            y_start = (int)(p_point / twidth) * 2 + field;
+            y_step = 2;
+            if (output_ntsc)
+                y_offset = (262 - 240) * 2;
+            else
+                y_offset = (312 - 288) * 2;
+        }
+        y_start -= y_offset;
 
         unsigned int p_phase = (unsigned int)(fmodf(vhs_head_switching_phase + noise, 1.0f) * t);
         unsigned int x_start = p_phase % twidth;
 
-        if (output_ntsc)
-            y_start -= (262 - 240) * 2;
-        else
-            y_start -= (312 - 288) * 2;
-
         s_y_start = y_start;
         s_tx_start = x_start;
+        s_y_step = y_step;
 
         int ishif;
         if (x_start >= (twidth / 2))
@@ -350,7 +372,7 @@ __global__ void kernel_vhs_head_switching(
         // Precompute shif for each affected scanline (geometric decay)
         int shif = 0;
         int num_lines = 0;
-        for (int y = y_start, shy = 0; y < height && num_lines < 160; y += 2, shy++) {
+        for (int y = y_start, shy = 0; y < height && num_lines < 160; y += y_step, shy++) {
             if (shy == 0)
                 shif = ishif;
             else
@@ -366,20 +388,34 @@ __global__ void kernel_vhs_head_switching(
     int num_lines = s_num_lines;
     unsigned int twidth = s_twidth;
     int y_base = s_y_start;
+    int y_step = s_y_step;
     unsigned int tx_start = s_tx_start;
 
     // Find first valid y (>= 0)
     int first_valid_y = y_base;
-    while (first_valid_y < 0) first_valid_y += 2;
+    while (first_valid_y < 0) first_valid_y += y_step;
 
     // Process lines one at a time, parallelizing the pixel-level work within
     // each line across all threads in the block.
     for (int line_idx = 0; line_idx < num_lines; line_idx++) {
-        int y = first_valid_y + line_idx * 2;
+        int y = first_valid_y + line_idx * y_step;
         if (y >= height) break;
 
         int shif = s_shif[line_idx];
-        if (shif == 0) continue;
+
+        // Clear I/Q (chroma) for all head-switching-affected scanlines.
+        // Real VHS loses color lock in this region, producing monochrome output.
+        int* I = fI + (y * width);
+        int* Q = fQ + (y * width);
+        for (int xx = threadIdx.x; xx < width; xx += blockDim.x) {
+            I[xx] = 0;
+            Q[xx] = 0;
+        }
+
+        if (shif == 0) {
+            __syncthreads();
+            continue;
+        }
 
         int* Y = fY + (y * width);
         int* tmp = scratch_tmp;  // one line at a time, so sharing is fine
@@ -425,10 +461,11 @@ __global__ void kernel_scanline_post_composite(
     // cuRAND
     curandState* __restrict__ rand_states,
     // scratch buffer for chroma decode (avoids local memory spill)
-    int* __restrict__ chroma_scratch)
+    int* __restrict__ chroma_scratch,
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     int* Y = fY + (y * width);
@@ -539,10 +576,11 @@ __global__ void kernel_scanline_vhs(
     int* __restrict__ fY, int* __restrict__ fI, int* __restrict__ fQ,
     int width, int height, unsigned int field,
     float luma_cut, float chroma_cut, int chroma_delay,
-    float vhs_out_sharpen)
+    float vhs_out_sharpen,
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     int* Y = fY + (y * width);
@@ -603,7 +641,8 @@ __global__ void kernel_scanline_vhs(
 // This is much faster than a single thread because columns are independent.
 __global__ void kernel_vhs_chroma_vert_blend(
     int* __restrict__ fI, int* __restrict__ fQ,
-    int width, int height, unsigned int field)
+    int width, int height, unsigned int field,
+    bool progressive)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     if (x >= width) return;
@@ -611,7 +650,10 @@ __global__ void kernel_vhs_chroma_vert_blend(
     int prev_U = 0;
     int prev_V = 0;
 
-    for (int y = (int)(field + 2); y < height; y += 2) {
+    int y_start = progressive ? 1 : (field == 0 ? 2 : 1);
+    int y_step = progressive ? 1 : 2;
+
+    for (int y = y_start; y < height; y += y_step) {
         int idx = y * width + x;
         int cU = fI[idx];
         int cV = fQ[idx];
@@ -631,10 +673,11 @@ __global__ void kernel_scanline_vhs_reencode(
     int subcarrier_amplitude, int subcarrier_amplitude_back,
     int video_scanline_phase_shift, int video_scanline_phase_shift_offset,
     // scratch buffer for chroma decode (avoids local memory spill)
-    int* __restrict__ chroma_scratch)
+    int* __restrict__ chroma_scratch,
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     int* Y = fY + (y * width);
@@ -712,10 +755,11 @@ __global__ void kernel_chroma_dropout(
     int* __restrict__ fI, int* __restrict__ fQ,
     int width, int height, unsigned int field,
     int video_chroma_loss,
-    curandState* __restrict__ rand_states)
+    curandState* __restrict__ rand_states,
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     curandState localState = rand_states[scanline_idx];
@@ -733,10 +777,11 @@ __global__ void kernel_chroma_dropout(
 __global__ void kernel_chroma_lowpass_out(
     int* __restrict__ fI, int* __restrict__ fQ,
     int width, int height, unsigned int field,
-    int mode)  // 0 = full bandwidth limits, 1 = lite (TV-style)
+    int mode,  // 0 = full bandwidth limits, 1 = lite (TV-style)
+    bool progressive)
 {
     int scanline_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
     if (y >= height) return;
 
     const float rate = (315000000.0f * 4) / 88;
@@ -772,11 +817,12 @@ __global__ void kernel_chroma_lowpass_out(
 __global__ void kernel_yiq_to_rgb(
     const int* __restrict__ fY, const int* __restrict__ fI, const int* __restrict__ fQ,
     uint8_t* __restrict__ dst_bgra, int dst_stride,
-    int width, int height, unsigned int field)
+    int width, int height, unsigned int field,
+    bool progressive)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int scanline_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int y = field + scanline_idx * 2;
+    int y = progressive ? scanline_idx : (field + scanline_idx * 2);
 
     if (x >= width || y >= height) return;
 
@@ -802,7 +848,7 @@ __global__ void kernel_init_rand(curandState* states, int count, unsigned long l
 // ═════════════════════════════════════════════════════════════════════════════
 
 bool ntsc_cuda_init(int width, int height, int priority) {
-    gpu_max_scanlines = (height + 1) / 2;  // max scanlines per field
+    gpu_max_scanlines = height;  // allocate for max (progressive uses all, interlaced uses half)
     gpu_frame_bgra_size = (size_t)width * height * 4;
     gpu_width = width;
 
@@ -929,10 +975,10 @@ static void process_frame_on_buffer(
     const int height = p.height;
     const unsigned int field = p.field;
     const unsigned long long fieldno = p.fieldno;
+    const bool progressive = p.progressive;
 
-    // Number of active scanlines in this field
-    int num_scanlines = 0;
-    for (int y = (int)field; y < height; y += 2) num_scanlines++;
+    // Number of active scanlines
+    int num_scanlines = progressive ? height : ((height + 1 - field) / 2);
 
     // ── Upload source frame via pinned staging buffer ──
     // Copy pageable AVFrame data → pinned (CPU memcpy, but enables true async DMA).
@@ -966,7 +1012,8 @@ static void process_frame_on_buffer(
         kernel_rgb_to_yiq<<<grid, block, 0, stream>>>(
             buf.d_src_bgra, width * 4,
             buf.d_fY, buf.d_fI, buf.d_fQ,
-            width, height, field, p.opposite);
+            width, height, field, p.opposite,
+            progressive);
     }
 
     // ── Kernel 2+3+4+5 MERGED: pre-composite scanline processing ──
@@ -982,24 +1029,12 @@ static void process_frame_on_buffer(
             p.video_noise,
             (float)p.composite_preemphasis, (float)p.composite_preemphasis_cut,
             p.composite_in_chroma_lowpass, do_preemphasis, do_noise,
-            buf.d_rand_states);
-    }
-
-    // ── Kernel 6: VHS head switching ──
-    // Uses 1 block with 128 threads: thread 0 computes shift values,
-    // then all threads cooperate on per-pixel shift operations.
-    if (p.vhs_head_switching) {
-        kernel_vhs_head_switching<<<1, 128, 0, stream>>>(
-            buf.d_fY, width, height, field,
-            p.output_ntsc,
-            (float)p.vhs_head_switching_point,
-            (float)p.vhs_head_switching_phase,
-            (float)p.vhs_head_switching_phase_noise,
             buf.d_rand_states,
-            buf.d_scratch_tmp);
+            progressive);
     }
 
     // ── Kernel 7+8+9 MERGED: post-composite scanline processing ──
+    // (Head switching moved after this — see below)
     {
         bool do_decode = !p.nocolor_subcarrier;
         bool do_chroma_noise = (p.video_chroma_noise != 0);
@@ -1014,7 +1049,24 @@ static void process_frame_on_buffer(
             p.video_chroma_noise, do_chroma_noise,
             p.video_chroma_phase_noise, do_phase_noise,
             buf.d_rand_states,
-            buf.d_scratch);
+            buf.d_scratch,
+            progressive);
+    }
+
+    // ── Kernel 6 (moved): VHS head switching ──
+    // Must run AFTER post-composite (chroma_from_luma) so that zeroing I/Q
+    // is not overwritten by subcarrier decode. Runs BEFORE VHS processing
+    // so that VHS re-encode sees zero chroma in the affected region.
+    if (p.vhs_head_switching) {
+        kernel_vhs_head_switching<<<1, 128, 0, stream>>>(
+            buf.d_fY, buf.d_fI, buf.d_fQ, width, height, field,
+            p.output_ntsc,
+            (float)p.vhs_head_switching_point,
+            (float)p.vhs_head_switching_phase,
+            (float)p.vhs_head_switching_phase_noise,
+            buf.d_rand_states,
+            buf.d_scratch_tmp,
+            progressive);
     }
 
     // ── Kernel 10: VHS processing ──
@@ -1032,14 +1084,16 @@ static void process_frame_on_buffer(
         // VHS luma LP + chroma LP + sharpen (merged into single kernel)
         kernel_scanline_vhs<<<scanline_blocks, scanline_threads, 0, stream>>>(
             buf.d_fY, buf.d_fI, buf.d_fQ, width, height, field,
-            (float)luma_cut, (float)chroma_cut, chroma_delay, (float)p.vhs_out_sharpen);
+            (float)luma_cut, (float)chroma_cut, chroma_delay, (float)p.vhs_out_sharpen,
+            progressive);
 
         // VHS chroma vertical blend (NTSC only) — parallelized by column
         if (p.vhs_chroma_vert_blend && p.output_ntsc) {
             int col_threads = 256;
             int col_blocks = (width + col_threads - 1) / col_threads;
             kernel_vhs_chroma_vert_blend<<<col_blocks, col_threads, 0, stream>>>(
-                buf.d_fI, buf.d_fQ, width, height, field);
+                buf.d_fI, buf.d_fQ, width, height, field,
+                progressive);
         }
 
         // VHS re-encode/decode if not S-Video out (merged)
@@ -1049,7 +1103,8 @@ static void process_frame_on_buffer(
                 width, height, field, fieldno,
                 p.subcarrier_amplitude, p.subcarrier_amplitude_back,
                 p.video_scanline_phase_shift, p.video_scanline_phase_shift_offset,
-                buf.d_scratch);
+                buf.d_scratch,
+                progressive);
         }
     }
 
@@ -1057,14 +1112,16 @@ static void process_frame_on_buffer(
     if (p.video_chroma_loss != 0) {
         kernel_chroma_dropout<<<scanline_blocks, scanline_threads, 0, stream>>>(
             buf.d_fI, buf.d_fQ, width, height, field,
-            p.video_chroma_loss, buf.d_rand_states);
+            p.video_chroma_loss, buf.d_rand_states,
+            progressive);
     }
 
     // ── Kernel 12: Output chroma lowpass ──
     if (p.composite_out_chroma_lowpass) {
         int mode = p.composite_out_chroma_lowpass_lite ? 1 : 0;
         kernel_chroma_lowpass_out<<<scanline_blocks, scanline_threads, 0, stream>>>(
-            buf.d_fI, buf.d_fQ, width, height, field, mode);
+            buf.d_fI, buf.d_fQ, width, height, field, mode,
+            progressive);
     }
 
     // ── Kernel 13: YIQ → RGB ──
@@ -1075,7 +1132,8 @@ static void process_frame_on_buffer(
         kernel_yiq_to_rgb<<<grid, block, 0, stream>>>(
             buf.d_fY, buf.d_fI, buf.d_fQ,
             buf.d_dst_bgra, width * 4,
-            width, height, field);
+            width, height, field,
+            progressive);
     }
 
     // ── Download result BGRA via pinned staging buffer ──

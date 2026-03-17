@@ -15,11 +15,13 @@ if(ENABLE_CUDA)
         enable_language(CUDA)
         find_package(CUDAToolkit REQUIRED)
         set(HAVE_CUDA TRUE)
-        # Generate native SASS for the target GPU architecture.
-        # sm_89 = Ada Lovelace (RTX 4070 Super). This avoids PTX JIT
-        # compatibility issues when toolkit version > driver CUDA version.
-        # Add more architectures here for broader GPU support.
-        set(CMAKE_CUDA_ARCHITECTURES 89)
+        # Generate native SASS for multiple GPU architecture generations.
+        # sm_75 = Turing (GTX 1660, RTX 2060-2080) — minimum for CUDA 13.x
+        # sm_86 = Ampere (RTX 3060-3090)
+        # sm_89 = Ada Lovelace (RTX 4060-4090)
+        # Older GPUs (GTX 10xx / Pascal) are not supported by CUDA 13.x
+        # and will use the CPU fallback path automatically.
+        set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
         message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER_VERSION}")
     else()
         message(WARNING "CUDA compiler not found. Building CPU-only version.")
